@@ -394,6 +394,16 @@ class CodePredictorWrapperConfig:
     use_projection: bool = False
     return_proj_buf: bool = False
     sampling_mode: str = "stored"
+    early_exit_enabled: bool = False
+    early_exit_metric: str = "entropy"
+    early_exit_min_keep: int = 8
+    early_exit_entropy_threshold: float = 0.9
+    early_exit_confidence_threshold: float = 0.45
+    early_exit_margin_threshold: float = 0.1
+    early_exit_patience: int = 1
+    early_exit_fill_strategy: str = "pad"
+    early_exit_pad_token: int = 0
+    early_exit_prior_tokens: Sequence[int] | None = None
 
 
 # ===================================================================
@@ -431,9 +441,11 @@ class CodePredictorWrapper(nn.Module):
         self.config = cp_config
         self._wrapper_config = wrapper_config
         self.prefix = prefix
+        extra_cfg = self._stage_connector_extra_config(vllm_config)
 
         self._num_groups = int(cp_config.num_code_groups)
         self._cp_hidden = int(cp_config.hidden_size)
+        self._vocab_size = int(cp_config.vocab_size)
 
         # For Omni backward compat (accessed by the talker)
         self.num_code_groups = self._num_groups
@@ -462,6 +474,67 @@ class CodePredictorWrapper(nn.Module):
         self._top_k: int = 50
         self._top_p: float = 0.8
 
+        # Optional dynamic early-exit. These flags are intentionally off by
+        # default and can be enabled through stage_connector_config.extra.
+        self._early_exit_enabled = self._parse_bool_config(
+            extra_cfg.get("code_predictor_early_exit_enabled", wrapper_config.early_exit_enabled)
+        )
+        self._early_exit_metric = self._parse_string_config(
+            extra_cfg.get("code_predictor_early_exit_metric", wrapper_config.early_exit_metric)
+        ).lower()
+        self._early_exit_min_keep = self._parse_int_config(
+            extra_cfg.get("code_predictor_early_exit_min_keep", wrapper_config.early_exit_min_keep),
+            default=wrapper_config.early_exit_min_keep,
+            minimum=1,
+        )
+        self._early_exit_entropy_threshold = self._parse_float_config(
+            extra_cfg.get(
+                "code_predictor_early_exit_entropy_threshold",
+                wrapper_config.early_exit_entropy_threshold,
+            ),
+            default=wrapper_config.early_exit_entropy_threshold,
+        )
+        self._early_exit_confidence_threshold = self._parse_float_config(
+            extra_cfg.get(
+                "code_predictor_early_exit_confidence_threshold",
+                wrapper_config.early_exit_confidence_threshold,
+            ),
+            default=wrapper_config.early_exit_confidence_threshold,
+        )
+        self._early_exit_margin_threshold = self._parse_float_config(
+            extra_cfg.get(
+                "code_predictor_early_exit_margin_threshold",
+                wrapper_config.early_exit_margin_threshold,
+            ),
+            default=wrapper_config.early_exit_margin_threshold,
+        )
+        self._early_exit_patience = self._parse_int_config(
+            extra_cfg.get("code_predictor_early_exit_patience", wrapper_config.early_exit_patience),
+            default=wrapper_config.early_exit_patience,
+            minimum=1,
+        )
+        self._early_exit_fill_strategy = self._parse_string_config(
+            extra_cfg.get("code_predictor_early_exit_fill_strategy", wrapper_config.early_exit_fill_strategy)
+        ).lower()
+        self._early_exit_pad_token = self._normalize_code_token(
+            self._parse_int_config(
+                extra_cfg.get("code_predictor_early_exit_pad_token", wrapper_config.early_exit_pad_token),
+                default=wrapper_config.early_exit_pad_token,
+                minimum=0,
+            )
+        )
+        self._early_exit_prior_tokens = self._parse_int_list_config(
+            extra_cfg.get("code_predictor_early_exit_prior_tokens", wrapper_config.early_exit_prior_tokens)
+        )
+        if self._early_exit_enabled:
+            self._validate_early_exit_config()
+            logger.info_once(
+                "code_predictor: early exit enabled metric=%s min_keep=%d fill=%s",
+                self._early_exit_metric,
+                self._early_exit_min_keep,
+                self._early_exit_fill_strategy,
+            )
+
         # Lazily initialised state
         self._proj_buf: torch.Tensor | None = None
         self._model_dtype: torch.dtype | None = None
@@ -471,8 +544,7 @@ class CodePredictorWrapper(nn.Module):
         self._lm_heads_list: list[nn.Module] | None = None
         self._codec_embeds_list: list[nn.Module] | None = None
         self._device_graphs: dict[int | tuple[int, int], tuple] = {}  # (graph, static_output) per bucket
-        prefix_graph_cfg = self._stage_connector_extra_config(vllm_config)
-        prefix_graphs_requested = self._parse_bool_config(prefix_graph_cfg.get("code_predictor_prefix_graphs"))
+        prefix_graphs_requested = self._parse_bool_config(extra_cfg.get("code_predictor_prefix_graphs"))
         self._prefix_graphs_enabled = prefix_graphs_requested and wrapper_config.use_cuda_graphs
         if prefix_graphs_requested and not self._prefix_graphs_enabled:
             logger.info_once(
@@ -480,10 +552,10 @@ class CodePredictorWrapper(nn.Module):
                 wrapper_config.use_cuda_graphs,
             )
         self._prefix_graph_buckets = self._parse_positive_int_set(
-            prefix_graph_cfg.get("code_predictor_prefix_graph_buckets")
+            extra_cfg.get("code_predictor_prefix_graph_buckets")
         )
         self._prefix_graph_seq_lens = self._parse_positive_int_set(
-            prefix_graph_cfg.get("code_predictor_prefix_graph_seq_lens")
+            extra_cfg.get("code_predictor_prefix_graph_seq_lens")
         )
 
     def get_input_embeddings(self) -> nn.ModuleList:
@@ -581,6 +653,53 @@ class CodePredictorWrapper(nn.Module):
         return False
 
     @staticmethod
+    def _parse_string_config(value: object) -> str:
+        return "" if value is None else str(value).strip()
+
+    @staticmethod
+    def _parse_int_config(value: object, *, default: int, minimum: int | None = None) -> int:
+        if value is None:
+            parsed = int(default)
+        else:
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid int config value {value!r}") from exc
+        if minimum is not None and parsed < minimum:
+            parsed = minimum
+        return parsed
+
+    @staticmethod
+    def _parse_float_config(value: object, *, default: float) -> float:
+        if value is None:
+            return float(default)
+        try:
+            return float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid float config value {value!r}") from exc
+
+    @staticmethod
+    def _parse_int_list_config(value: object) -> list[int] | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            raw_values = [item.strip() for item in value.replace(";", ",").split(",") if item.strip()]
+        elif isinstance(value, int):
+            raw_values = [value]
+        else:
+            try:
+                raw_values = list(value)
+            except TypeError as exc:
+                raise ValueError(f"Invalid int list config value {value!r}") from exc
+        out: list[int] = []
+        for item in raw_values:
+            try:
+                out.append(int(item))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid int list config value {item!r}") from exc
+        return out
+
+    @staticmethod
     def _parse_positive_int_set(value: object) -> set[int]:
         if value is None:
             return set()
@@ -602,6 +721,95 @@ class CodePredictorWrapper(nn.Module):
             if parsed > 0:
                 values.add(parsed)
         return values
+
+    def _normalize_code_token(self, token: int) -> int:
+        return min(max(int(token), 0), self._vocab_size - 1)
+
+    def _validate_early_exit_config(self) -> None:
+        valid_metrics = {
+            "entropy",
+            "confidence",
+            "entropy_or_confidence",
+            "entropy_and_confidence",
+        }
+        if self._early_exit_metric not in valid_metrics:
+            raise ValueError(
+                "Invalid code_predictor_early_exit_metric="
+                f"{self._early_exit_metric!r}; expected one of {sorted(valid_metrics)}."
+            )
+        valid_fill = {"pad", "prior"}
+        if self._early_exit_fill_strategy not in valid_fill:
+            raise ValueError(
+                "Invalid code_predictor_early_exit_fill_strategy="
+                f"{self._early_exit_fill_strategy!r}; expected one of {sorted(valid_fill)}."
+            )
+
+    def _early_exit_trigger(self, probs: torch.Tensor) -> torch.Tensor:
+        """Return a per-row mask indicating whether this step is low-value."""
+        top2 = probs.topk(min(2, probs.shape[-1]), dim=-1).values
+        confidence = top2[:, 0]
+        if top2.shape[-1] > 1:
+            margin = top2[:, 0] - top2[:, 1]
+        else:
+            margin = torch.ones_like(confidence)
+
+        entropy = -(probs * (probs.clamp_min(1e-20).log())).sum(dim=-1)
+        support = (probs > 0).sum(dim=-1).to(dtype=torch.float32).clamp_min(2.0)
+        norm_entropy = entropy / support.log()
+        entropy_trigger = norm_entropy >= self._early_exit_entropy_threshold
+        confidence_trigger = (confidence <= self._early_exit_confidence_threshold) | (
+            margin <= self._early_exit_margin_threshold
+        )
+
+        if self._early_exit_metric == "entropy":
+            return entropy_trigger
+        if self._early_exit_metric == "confidence":
+            return confidence_trigger
+        if self._early_exit_metric == "entropy_and_confidence":
+            return entropy_trigger & confidence_trigger
+        return entropy_trigger | confidence_trigger
+
+    def _early_exit_fill_token(self, codebook_idx: int) -> int:
+        if self._early_exit_fill_strategy == "pad" or not self._early_exit_prior_tokens:
+            return self._early_exit_pad_token
+
+        tokens = self._early_exit_prior_tokens
+        if len(tokens) >= self._num_groups:
+            token = tokens[codebook_idx]
+        elif len(tokens) == self._num_groups - 1 and codebook_idx > 0:
+            token = tokens[codebook_idx - 1]
+        else:
+            token = tokens[min(codebook_idx, len(tokens) - 1)]
+        return self._normalize_code_token(token)
+
+    def _fill_remaining_codebooks(
+        self,
+        *,
+        all_codes: torch.Tensor,
+        proj_buf: torch.Tensor,
+        start_codebook: int,
+        bsz: int,
+        dtype: torch.dtype,
+        projection: nn.Module,
+        codec_embeds: list[nn.Module],
+    ) -> None:
+        """Fill codebooks start_codebook..G-1 after an early exit."""
+        if start_codebook >= self._num_groups:
+            return
+        device = all_codes.device
+        for codebook_idx in range(start_codebook, self._num_groups):
+            fill_token = self._early_exit_fill_token(codebook_idx)
+            code = torch.full((bsz, 1), fill_token, dtype=torch.long, device=device)
+            if self._wrapper_config.return_proj_buf:
+                all_codes[:, codebook_idx] = code
+            else:
+                all_codes[:, codebook_idx] = code.reshape(bsz)
+
+            if self._wrapper_config.return_proj_buf:
+                new_embed = codec_embeds[codebook_idx - 1](code)
+                proj_buf[:bsz, codebook_idx + 1, :] = projection(new_embed.reshape(bsz, 1, -1).to(dtype)).reshape(
+                    bsz, -1
+                )
 
     def _prefix_seq_lens(self, max_seq: int) -> list[int]:
         all_seq_lens = list(range(2, max_seq))
@@ -855,6 +1063,8 @@ class CodePredictorWrapper(nn.Module):
             all_codes = torch.empty(bsz, num_groups, dtype=torch.long, device=device)
             all_codes[:, 0] = layer0_code.reshape(bsz)
 
+        early_exit_hits = 0
+
         # Autoregressive loop: predict layers 1..G-1
         for step in range(1, num_groups):
             graph_key: int | tuple[int, int] = padded_bsz
@@ -884,6 +1094,7 @@ class CodePredictorWrapper(nn.Module):
                 hidden_out = model_fwd(proj_buf[:padded_bsz, :seq_len, :], pos_ids)
 
             logits = lm_heads[step - 1](hidden_out[:bsz, step, :])
+            score_probs: torch.Tensor
 
             # Sample next code
             if stored_mode:
@@ -899,6 +1110,7 @@ class CodePredictorWrapper(nn.Module):
                     sorted_logits[remove_mask] = float("-inf")
                     logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
                 probs = F.softmax(logits, dim=-1, dtype=torch.float32)
+                score_probs = probs
                 code = self._multinomial(probs, generator, generators)
             else:
                 # "per_call" mode: temperature-scaled + top-k
@@ -908,8 +1120,10 @@ class CodePredictorWrapper(nn.Module):
                         topk_vals, _ = scaled.topk(top_k, dim=-1)
                         scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
                     probs = F.softmax(scaled, dim=-1, dtype=torch.float32)
+                    score_probs = probs
                     code = self._multinomial(probs, generator, generators)
                 else:
+                    score_probs = F.softmax(logits, dim=-1, dtype=torch.float32)
                     code = logits.argmax(dim=-1, keepdim=True)
 
             # Store code
@@ -922,6 +1136,24 @@ class CodePredictorWrapper(nn.Module):
             if step < num_groups - 1 or self._wrapper_config.return_proj_buf:
                 new_embed = codec_embeds[step - 1](code)
                 proj_buf[:bsz, step + 1, :] = projection(new_embed.reshape(bsz, 1, -1)).reshape(bsz, -1)
+
+            if self._early_exit_enabled and step < num_groups - 1 and step + 1 >= self._early_exit_min_keep:
+                trigger = self._early_exit_trigger(score_probs)
+                if bool(trigger.all().item()):
+                    early_exit_hits += 1
+                else:
+                    early_exit_hits = 0
+                if early_exit_hits >= self._early_exit_patience:
+                    self._fill_remaining_codebooks(
+                        all_codes=all_codes,
+                        proj_buf=proj_buf,
+                        start_codebook=step + 1,
+                        bsz=bsz,
+                        dtype=dtype,
+                        projection=projection,
+                        codec_embeds=codec_embeds,
+                    )
+                    break
 
         if self._wrapper_config.return_proj_buf:
             return all_codes, proj_buf[:bsz].clone()
