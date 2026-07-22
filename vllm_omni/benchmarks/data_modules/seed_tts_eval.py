@@ -425,15 +425,16 @@ def _ensure_zh_asr() -> None:
         from funasr import AutoModel
 
         _device = _get_eval_device()
+        mid = os.environ.get("SEED_TTS_PARAFORMER_MODEL", PARAFORMER_MODEL_ID) or PARAFORMER_MODEL_ID
         logger.warning(
             "Loading Seed-TTS eval Paraformer %r on %s (one-time, seed-tts-eval protocol)...",
-            PARAFORMER_MODEL_ID,
+            mid,
             _device,
         )
         try:
-            _zh_paraformer = AutoModel(model=PARAFORMER_MODEL_ID, device=_device)
+            _zh_paraformer = AutoModel(model=mid, device=_device)
         except TypeError:
-            _zh_paraformer = AutoModel(model=PARAFORMER_MODEL_ID)
+            _zh_paraformer = AutoModel(model=mid)
 
 
 def _transcribe_en_f32_16k(wav_f32: np.ndarray) -> str:
