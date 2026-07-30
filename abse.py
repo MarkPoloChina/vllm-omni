@@ -26,6 +26,8 @@ import argparse
 import json
 import re
 import time
+
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -130,6 +132,7 @@ def _summary_row(label: str, result_path: Path, result: dict[str, Any]) -> dict[
     return {
         "label": label,
         "timestamp": int(time.time()),
+        "datatime": datetime.now().strftime("%Y%m%d_%H%M%S"),
         "result_path": str(result_path),
         "seed_tts_content_evaluated": result.get("seed_tts_content_evaluated"),
         "seed_tts_content_error_mean": result.get("seed_tts_content_error_mean"),
@@ -157,7 +160,8 @@ def main() -> int:
     args.result_dir.mkdir(parents=True, exist_ok=True)
     args.summary_jsonl.parent.mkdir(parents=True, exist_ok=True)
     before = set(args.result_dir.glob("qwen_omni_acc_seed_tts_*.json"))
-    result_filename = f"qwen_omni_acc_seed_tts_{_safe_filename_token(args.label)}_{int(time.time())}.json"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    result_filename = f"qwen_omni_acc_seed_tts_{_safe_filename_token(args.label)}_{timestamp}.json"
     dataset_path = args.seed_tts_dataset_path or DEFAULT_SEED_TTS_DATASET
 
     bench_argv = [
@@ -215,7 +219,7 @@ def main() -> int:
         "SEED_TTS_WER_EVAL": "1",
         "SEED_TTS_SIM_EVAL": "1",
         "SEED_TTS_UTMOS_EVAL": "0",
-        "ASCEND_RT_VISIBLE_DEVICES": "0"
+        "ASCEND_RT_VISIBLE_DEVICES": "7"
     }
     if args.seed_tts_eval_device:
         extra_env["SEED_TTS_EVAL_DEVICE"] = args.seed_tts_eval_device
