@@ -962,6 +962,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             # Some checkpoints do not include speaker_encoder weights; keep the
             # eagerly initialized module and satisfy the strict loader check.
             loaded |= {name for name, _ in self.named_parameters() if name.startswith("speaker_encoder.")}
+
+        # The compact RVQ-tail student is a deployment sidecar rather than a
+        # tensor in the upstream Qwen3-TTS checkpoint.
+        distillation_loaded = self.code_predictor.load_distillation_weights()
+        loaded |= {f"code_predictor.{name}" for name in distillation_loaded}
+
         # Load speech tokenizer encoder weights from speech_tokenizer/
         # subfolder.  Skip decoder weights — the Talker only uses the
         # encoder for ref_audio encoding.

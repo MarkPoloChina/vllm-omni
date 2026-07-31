@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Iterable, Sequence
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -24,6 +25,10 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from vllm_omni.model_executor.models.common.qwen3_code_predictor_tail import (
+    RVQTailDistillationConfig,
+    RVQTailDistillationModel,
+)
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -404,6 +409,10 @@ class CodePredictorWrapperConfig:
     early_exit_fill_strategy: str = "pad"
     early_exit_pad_token: int = 0
     early_exit_prior_tokens: Sequence[int] | None = None
+    truncation_mode: str = "none"
+    truncation_k: int = 8
+    distillation_state_size: int = 384
+    distillation_weights: str | None = None
 
 
 # ===================================================================
@@ -474,11 +483,26 @@ class CodePredictorWrapper(nn.Module):
         self._top_k: int = 50
         self._top_p: float = 0.8
 
-        # Optional dynamic early-exit. These flags are intentionally off by
-        # default and can be enabled through stage_connector_config.extra.
-        self._early_exit_enabled = self._parse_bool_config(
+        # Keep the original perceptual early-exit configuration available, but
+        # select it explicitly through truncation_mode.  If the new option is
+        # absent, preserve compatibility with early_exit_enabled.
+        legacy_early_exit_enabled = self._parse_bool_config(
             extra_cfg.get("code_predictor_early_exit_enabled", wrapper_config.early_exit_enabled)
         )
+        configured_truncation_mode = self._parse_string_config(
+            extra_cfg.get("code_predictor_truncation_mode", wrapper_config.truncation_mode)
+        ).lower()
+        if not configured_truncation_mode or (
+            "code_predictor_truncation_mode" not in extra_cfg and legacy_early_exit_enabled
+        ):
+            configured_truncation_mode = "perceptual" if legacy_early_exit_enabled else "none"
+        self._truncation_mode = configured_truncation_mode
+        self._fixed_truncation_k = self._parse_int_config(
+            extra_cfg.get("code_predictor_truncation_k", wrapper_config.truncation_k),
+            default=wrapper_config.truncation_k,
+            minimum=2,
+        )
+        self._early_exit_enabled = self._truncation_mode == "perceptual"
         self._early_exit_metric = self._parse_string_config(
             extra_cfg.get("code_predictor_early_exit_metric", wrapper_config.early_exit_metric)
         ).lower()
@@ -526,12 +550,43 @@ class CodePredictorWrapper(nn.Module):
         self._early_exit_prior_tokens = self._parse_int_list_config(
             extra_cfg.get("code_predictor_early_exit_prior_tokens", wrapper_config.early_exit_prior_tokens)
         )
-        if self._early_exit_enabled:
-            self._validate_early_exit_config()
+        self._distillation_state_size = self._parse_int_config(
+            extra_cfg.get(
+                "code_predictor_distillation_state_size",
+                wrapper_config.distillation_state_size,
+            ),
+            default=wrapper_config.distillation_state_size,
+            minimum=1,
+        )
+        self._distillation_weights = self._parse_string_config(
+            extra_cfg.get(
+                "code_predictor_distillation_weights",
+                wrapper_config.distillation_weights,
+            )
+        )
+        self._validate_truncation_config()
+
+        self.tail_distillation: RVQTailDistillationModel | None = None
+        if self._early_exit_fill_strategy == "distillation" and self._truncation_mode != "none":
+            self.tail_distillation = RVQTailDistillationModel(
+                RVQTailDistillationConfig(
+                    hidden_size=self._cp_hidden,
+                    state_size=self._distillation_state_size,
+                    num_code_groups=self._num_groups,
+                )
+            )
+
+        if self._truncation_mode == "perceptual":
             logger.info_once(
-                "code_predictor: early exit enabled metric=%s min_keep=%d fill=%s",
+                "code_predictor: perceptual truncation enabled metric=%s min_keep=%d fill=%s",
                 self._early_exit_metric,
                 self._early_exit_min_keep,
+                self._early_exit_fill_strategy,
+            )
+        elif self._truncation_mode == "fixed":
+            logger.info_once(
+                "code_predictor: fixed truncation enabled K=%d fill=%s",
+                self._fixed_truncation_k,
                 self._early_exit_fill_strategy,
             )
 
@@ -725,7 +780,20 @@ class CodePredictorWrapper(nn.Module):
     def _normalize_code_token(self, token: int) -> int:
         return min(max(int(token), 0), self._vocab_size - 1)
 
-    def _validate_early_exit_config(self) -> None:
+    def _validate_truncation_config(self) -> None:
+        """Validate fixed/perceptual truncation and tail-fill configuration."""
+        valid_modes = {"none", "fixed", "perceptual"}
+        if self._truncation_mode not in valid_modes:
+            raise ValueError(
+                "Invalid code_predictor_truncation_mode="
+                f"{self._truncation_mode!r}; expected one of {sorted(valid_modes)}."
+            )
+        if self._fixed_truncation_k > self._num_groups:
+            raise ValueError(
+                "code_predictor_truncation_k must not exceed num_code_groups: "
+                f"{self._fixed_truncation_k} > {self._num_groups}."
+            )
+
         valid_metrics = {
             "entropy",
             "confidence",
@@ -737,11 +805,20 @@ class CodePredictorWrapper(nn.Module):
                 "Invalid code_predictor_early_exit_metric="
                 f"{self._early_exit_metric!r}; expected one of {sorted(valid_metrics)}."
             )
-        valid_fill = {"pad", "prior"}
+        valid_fill = {"distillation", "pad", "prior"}
         if self._early_exit_fill_strategy not in valid_fill:
             raise ValueError(
                 "Invalid code_predictor_early_exit_fill_strategy="
                 f"{self._early_exit_fill_strategy!r}; expected one of {sorted(valid_fill)}."
+            )
+        if (
+            self._truncation_mode != "none"
+            and self._early_exit_fill_strategy == "distillation"
+            and not self._distillation_weights
+        ):
+            raise ValueError(
+                "code_predictor_distillation_weights is required when "
+                "code_predictor_early_exit_fill_strategy=distillation."
             )
 
     def _early_exit_trigger(self, probs: torch.Tensor) -> torch.Tensor:
@@ -810,6 +887,94 @@ class CodePredictorWrapper(nn.Module):
                 proj_buf[:bsz, codebook_idx + 1, :] = projection(new_embed.reshape(bsz, 1, -1).to(dtype)).reshape(
                     bsz, -1
                 )
+
+    def _complete_remaining_codebooks(
+        self,
+        *,
+        all_codes: torch.Tensor,
+        proj_buf: torch.Tensor,
+        start_codebook: int,
+        exit_hidden: torch.Tensor,
+        previous_code_embedding: torch.Tensor,
+        bsz: int,
+        dtype: torch.dtype,
+        projection: nn.Module,
+        codec_embeds: list[nn.Module],
+        lm_heads: list[nn.Module],
+        do_sample: bool,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        generator: torch.Generator | None,
+        generators: Sequence[torch.Generator | None] | None,
+    ) -> None:
+        """Complete truncated codebooks with either static or distilled fill.
+
+        Args:
+            all_codes: Output code tensor being populated.
+            proj_buf: Projected autoregressive input buffer.
+            start_codebook: First omitted codebook index.
+            exit_hidden: Last hidden state computed by the full predictor.
+            previous_code_embedding: Projected embedding of the last kept code.
+            bsz: Active batch size.
+            dtype: Full code-predictor dtype.
+            projection: Talker-to-code-predictor projection.
+            codec_embeds: Frozen residual-codebook embeddings.
+            lm_heads: Frozen per-codebook output heads.
+            do_sample: Whether per-call sampling is enabled.
+            temperature: Per-call sampling temperature.
+            top_k: Per-call top-k value.
+            top_p: Per-call top-p value.
+            generator: Optional shared random generator.
+            generators: Optional per-row random generators.
+        """
+        if self._early_exit_fill_strategy != "distillation":
+            self._fill_remaining_codebooks(
+                all_codes=all_codes,
+                proj_buf=proj_buf,
+                start_codebook=start_codebook,
+                bsz=bsz,
+                dtype=dtype,
+                projection=projection,
+                codec_embeds=codec_embeds,
+            )
+            return
+
+        student = self.tail_distillation
+        if student is None:
+            raise RuntimeError("Distillation fill requested without an initialized RVQ-tail student.")
+        student_dtype = next(student.parameters()).dtype
+        state, anchor = student.initialize(exit_hidden.to(dtype=student_dtype))
+        previous_embedding = previous_code_embedding.to(dtype=student_dtype)
+
+        for codebook_idx in range(start_codebook, self._num_groups):
+            predicted_hidden, state = student.predict_next(
+                state,
+                anchor,
+                previous_embedding,
+                codebook_idx,
+            )
+            logits = lm_heads[codebook_idx - 1](predicted_hidden.to(dtype=dtype))
+            code, _ = self._sample_logits(
+                logits,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                generator=generator,
+                generators=generators,
+            )
+            if self._wrapper_config.return_proj_buf:
+                all_codes[:, codebook_idx] = code
+            else:
+                all_codes[:, codebook_idx] = code.reshape(bsz)
+
+            if codebook_idx < self._num_groups - 1 or self._wrapper_config.return_proj_buf:
+                new_embed = codec_embeds[codebook_idx - 1](code)
+                projected = projection(new_embed.reshape(bsz, 1, -1).to(dtype)).reshape(bsz, -1)
+                previous_embedding = projected.to(dtype=student_dtype)
+                if self._wrapper_config.return_proj_buf:
+                    proj_buf[:bsz, codebook_idx + 1, :] = projected
 
     def _prefix_seq_lens(self, max_seq: int) -> list[int]:
         all_seq_lens = list(range(2, max_seq))
@@ -1000,6 +1165,61 @@ class CodePredictorWrapper(nn.Module):
             ]
         )
 
+    def _sample_logits(
+        self,
+        logits: torch.Tensor,
+        *,
+        do_sample: bool,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        generator: torch.Generator | None,
+        generators: Sequence[torch.Generator | None] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample one code and return the probability tensor used for scoring.
+
+        Args:
+            logits: Per-row code logits.
+            do_sample: Whether sampling is enabled in per-call mode.
+            temperature: Sampling temperature in per-call mode.
+            top_k: Top-k value in per-call mode.
+            top_p: Top-p value in per-call mode.
+            generator: Optional shared random generator.
+            generators: Optional per-row random generators.
+
+        Returns:
+            ``(sampled_code, probabilities)``.
+        """
+        if self._wrapper_config.sampling_mode == "stored":
+            if self._top_k > 0:
+                topk_vals, _ = logits.topk(self._top_k, dim=-1)
+                logits = logits.masked_fill(logits < topk_vals[:, -1:], float("-inf"))
+            if self._top_p < 1.0:
+                sorted_logits, sorted_idx = logits.sort(dim=-1, descending=True)
+                sorted_probs = F.softmax(sorted_logits, dim=-1, dtype=torch.float32)
+                cumulative_probs = sorted_probs.cumsum(dim=-1)
+                remove_mask = (cumulative_probs - sorted_probs) >= self._top_p
+                sorted_logits[remove_mask] = float("-inf")
+                logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
+            probs = F.softmax(logits, dim=-1, dtype=torch.float32)
+            return self._multinomial(probs, generator, generators), probs
+
+        use_sampling = do_sample and temperature > 0
+        if use_sampling and top_p != 1.0:
+            raise NotImplementedError(
+                "top_p sampling is not implemented for the vLLM-native code predictor; please set top_p=1.0."
+            )
+        if use_sampling:
+            scaled = logits * (1.0 / max(temperature, 1e-6))
+            if top_k > 0:
+                topk_vals, _ = scaled.topk(top_k, dim=-1)
+                scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
+            probs = F.softmax(scaled, dim=-1, dtype=torch.float32)
+            return self._multinomial(probs, generator, generators), probs
+
+        probs = F.softmax(logits, dim=-1, dtype=torch.float32)
+        return logits.argmax(dim=-1, keepdim=True), probs
+
     @torch.inference_mode()
     def forward(
         self,
@@ -1042,19 +1262,6 @@ class CodePredictorWrapper(nn.Module):
         proj_buf[:bsz, 0, :] = projection(last_talker_hidden.reshape(bsz, 1, -1).to(dtype)).reshape(bsz, -1)
         proj_buf[:bsz, 1, :] = projection(layer0_embed.reshape(bsz, 1, -1).to(dtype)).reshape(bsz, -1)
 
-        # Prepare sampling parameters
-        stored_mode = self._wrapper_config.sampling_mode == "stored"
-        if stored_mode:
-            s_top_k = self._top_k
-            s_top_p = self._top_p
-        else:
-            use_sampling = do_sample and temperature > 0
-            inv_temperature = 1.0 / max(temperature, 1e-6) if use_sampling else 0.0
-            if use_sampling and top_p != 1.0:
-                raise NotImplementedError(
-                    "top_p sampling is not implemented for the vLLM-native code predictor; please set top_p=1.0."
-                )
-
         # Output codes -- shape depends on return mode
         if self._wrapper_config.return_proj_buf:
             all_codes = torch.empty(bsz, num_groups, 1, dtype=torch.int64, device=device)
@@ -1094,37 +1301,15 @@ class CodePredictorWrapper(nn.Module):
                 hidden_out = model_fwd(proj_buf[:padded_bsz, :seq_len, :], pos_ids)
 
             logits = lm_heads[step - 1](hidden_out[:bsz, step, :])
-            score_probs: torch.Tensor
-
-            # Sample next code
-            if stored_mode:
-                # "stored" mode: top-k -> top-p -> softmax -> multinomial
-                if s_top_k > 0:
-                    topk_vals, _ = logits.topk(s_top_k, dim=-1)
-                    logits = logits.masked_fill(logits < topk_vals[:, -1:], float("-inf"))
-                if s_top_p < 1.0:
-                    sorted_logits, sorted_idx = logits.sort(dim=-1, descending=True)
-                    sorted_probs = F.softmax(sorted_logits, dim=-1, dtype=torch.float32)
-                    cumulative_probs = sorted_probs.cumsum(dim=-1)
-                    remove_mask = (cumulative_probs - sorted_probs) >= s_top_p
-                    sorted_logits[remove_mask] = float("-inf")
-                    logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
-                probs = F.softmax(logits, dim=-1, dtype=torch.float32)
-                score_probs = probs
-                code = self._multinomial(probs, generator, generators)
-            else:
-                # "per_call" mode: temperature-scaled + top-k
-                if use_sampling:
-                    scaled = logits * inv_temperature
-                    if top_k > 0:
-                        topk_vals, _ = scaled.topk(top_k, dim=-1)
-                        scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
-                    probs = F.softmax(scaled, dim=-1, dtype=torch.float32)
-                    score_probs = probs
-                    code = self._multinomial(probs, generator, generators)
-                else:
-                    score_probs = F.softmax(logits, dim=-1, dtype=torch.float32)
-                    code = logits.argmax(dim=-1, keepdim=True)
+            code, score_probs = self._sample_logits(
+                logits,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                generator=generator,
+                generators=generators,
+            )
 
             # Store code
             if self._wrapper_config.return_proj_buf:
@@ -1133,9 +1318,37 @@ class CodePredictorWrapper(nn.Module):
                 all_codes[:, step] = code.reshape(bsz)
 
             # Embed predicted code -> project -> next buffer position
+            projected_embed: torch.Tensor | None = None
             if step < num_groups - 1 or self._wrapper_config.return_proj_buf:
                 new_embed = codec_embeds[step - 1](code)
-                proj_buf[:bsz, step + 1, :] = projection(new_embed.reshape(bsz, 1, -1)).reshape(bsz, -1)
+                projected_embed = projection(new_embed.reshape(bsz, 1, -1).to(dtype)).reshape(bsz, -1)
+                proj_buf[:bsz, step + 1, :] = projected_embed
+
+            if (
+                self._truncation_mode == "fixed"
+                and step < num_groups - 1
+                and step + 1 >= self._fixed_truncation_k
+            ):
+                assert projected_embed is not None
+                self._complete_remaining_codebooks(
+                    all_codes=all_codes,
+                    proj_buf=proj_buf,
+                    start_codebook=step + 1,
+                    exit_hidden=hidden_out[:bsz, step, :],
+                    previous_code_embedding=projected_embed,
+                    bsz=bsz,
+                    dtype=dtype,
+                    projection=projection,
+                    codec_embeds=codec_embeds,
+                    lm_heads=lm_heads,
+                    do_sample=do_sample,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    generator=generator,
+                    generators=generators,
+                )
+                break
 
             if self._early_exit_enabled and step < num_groups - 1 and step + 1 >= self._early_exit_min_keep:
                 trigger = self._early_exit_trigger(score_probs)
@@ -1144,15 +1357,24 @@ class CodePredictorWrapper(nn.Module):
                 else:
                     early_exit_hits = 0
                 if early_exit_hits >= self._early_exit_patience:
-                    # print(f"Early exit hit in step {step}")
-                    self._fill_remaining_codebooks(
+                    assert projected_embed is not None
+                    self._complete_remaining_codebooks(
                         all_codes=all_codes,
                         proj_buf=proj_buf,
                         start_codebook=step + 1,
+                        exit_hidden=hidden_out[:bsz, step, :],
+                        previous_code_embedding=projected_embed,
                         bsz=bsz,
                         dtype=dtype,
                         projection=projection,
                         codec_embeds=codec_embeds,
+                        lm_heads=lm_heads,
+                        do_sample=do_sample,
+                        temperature=temperature,
+                        top_k=top_k,
+                        top_p=top_p,
+                        generator=generator,
+                        generators=generators,
                     )
                     break
 
@@ -1163,6 +1385,43 @@ class CodePredictorWrapper(nn.Module):
     # ------------------------------------------------------------------
     #  Weight loading
     # ------------------------------------------------------------------
+
+    def load_distillation_weights(self) -> set[str]:
+        """Load the configured RVQ-tail sidecar checkpoint.
+
+        Returns:
+            Fully qualified parameter names loaded into ``tail_distillation``.
+
+        Raises:
+            FileNotFoundError: If the configured sidecar does not exist.
+            RuntimeError: If checkpoint keys do not match the configured model.
+        """
+        student = self.tail_distillation
+        if student is None:
+            return set()
+
+        weights_path = Path(self._distillation_weights).expanduser()
+        if not weights_path.is_absolute():
+            model_root = Path(str(self._vllm_config.model_config.model)).expanduser()
+            weights_path = model_root / weights_path if model_root.is_dir() else weights_path
+        weights_path = weights_path.resolve()
+        if not weights_path.is_file():
+            raise FileNotFoundError(f"RVQ-tail distillation checkpoint not found: {weights_path}")
+
+        from safetensors.torch import load_file
+
+        state = load_file(str(weights_path), device="cpu")
+        prefix = "tail_distillation."
+        if state and all(name.startswith(prefix) for name in state):
+            state = {name[len(prefix) :]: value for name, value in state.items()}
+        incompatible = student.load_state_dict(state, strict=True)
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            raise RuntimeError(
+                "RVQ-tail distillation checkpoint mismatch: "
+                f"missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys}"
+            )
+        logger.info("Loaded RVQ-tail distillation checkpoint from %s", weights_path)
+        return {f"tail_distillation.{name}" for name, _ in student.named_parameters()}
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights directly (no fused projection remapping needed)."""
