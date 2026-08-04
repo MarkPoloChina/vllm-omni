@@ -314,6 +314,34 @@ def _deterministic_frame_subset(
     return hidden_states.index_select(0, indices), codec_ids.index_select(0, indices)
 
 
+def _align_talker_hidden_to_codec_frames(
+    hidden_states: torch.Tensor,
+    codec_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Select the Talker state that causally predicts each codec frame.
+
+    ``hidden_states`` is produced from ``inputs_embeds[:, :-1]``.  A codec
+    frame at original sequence position ``p`` is predicted by the Talker
+    state at ``p - 1``; that is also the state passed to the code predictor
+    during autoregressive inference.  Shift the frame mask left by one to
+    preserve this alignment and avoid exposing the current frame's codec
+    embeddings to its own code-predictor target.
+    """
+    if codec_mask.ndim != 2 or hidden_states.ndim != 3:
+        raise ValueError(
+            "Expected hidden_states [batch, sequence-1, hidden] and "
+            f"codec_mask [batch, sequence], got {tuple(hidden_states.shape)} "
+            f"and {tuple(codec_mask.shape)}."
+        )
+    expected_shape = (codec_mask.shape[0], codec_mask.shape[1] - 1)
+    if hidden_states.shape[:2] != expected_shape:
+        raise ValueError(
+            "Talker hidden states and shifted codec mask are incompatible: "
+            f"hidden prefix={tuple(hidden_states.shape[:2])}, expected={expected_shape}."
+        )
+    return hidden_states[codec_mask[:, 1:]]
+
+
 def _extract_code_predictor_teacher_targets(
     *,
     teacher: torch.nn.Module,
@@ -349,8 +377,16 @@ def _extract_code_predictor_teacher_targets(
             output_hidden_states=True,
             use_cache=False,
         )
-        talker_hidden = outputs.hidden_states[0][-1][batch["codec_mask"][:, :-1]]
+        talker_hidden = _align_talker_hidden_to_codec_frames(
+            outputs.hidden_states[0][-1],
+            batch["codec_mask"],
+        )
         frame_codes = codec_ids[batch["codec_mask"]]
+        if talker_hidden.shape[0] != frame_codes.shape[0]:
+            raise RuntimeError(
+                "Talker/code-frame alignment produced different row counts: "
+                f"hidden={talker_hidden.shape[0]}, codes={frame_codes.shape[0]}."
+            )
         talker_hidden, frame_codes = _deterministic_frame_subset(
             talker_hidden,
             frame_codes,
@@ -452,6 +488,16 @@ def _batches(rows: Sequence[SeedTTSRow], batch_size: int) -> Iterator[list[SeedT
     """Yield contiguous mini-batches from an already shuffled row sequence."""
     for start in range(0, len(rows), batch_size):
         yield list(rows[start : start + batch_size])
+
+
+def _accumulation_group_size(
+    batch_index: int,
+    num_batches: int,
+    gradient_accumulation_steps: int,
+) -> int:
+    """Return the actual size of this batch's epoch-local accumulation group."""
+    group_start = (batch_index // gradient_accumulation_steps) * gradient_accumulation_steps
+    return min(gradient_accumulation_steps, num_batches - group_start)
 
 
 def _save_checkpoint(
@@ -582,6 +628,8 @@ def main() -> int:
         epoch_rows = list(rows)
         random.Random(DATASET_SEED + epoch).shuffle(epoch_rows)
         num_batches = math.ceil(len(epoch_rows) / args.batch_size)
+        epoch_metric_totals = {name: 0.0 for name in ("loss", "ce", "kl", "hidden")}
+        epoch_frames = 0.0
         for batch_index, batch_rows in enumerate(_batches(epoch_rows, args.batch_size)):
             audio_codes, ref_wavs = _encode_batch_audio(teacher, batch_rows, num_groups)
             batch = _build_teacher_batch(
@@ -615,28 +663,54 @@ def main() -> int:
                 kl_weight=args.kl_weight,
                 hidden_weight=args.hidden_weight,
             )
-            (loss / args.gradient_accumulation_steps).backward()
+            accumulation_group_size = _accumulation_group_size(
+                batch_index,
+                num_batches,
+                args.gradient_accumulation_steps,
+            )
+            (loss / accumulation_group_size).backward()
             global_step += 1
             should_step = (
-                global_step % args.gradient_accumulation_steps == 0 or batch_index + 1 == num_batches
+                (batch_index + 1) % args.gradient_accumulation_steps == 0 or batch_index + 1 == num_batches
             )
+            grad_norm: float | None = None
             if should_step:
-                torch.nn.utils.clip_grad_norm_(student.parameters(), args.max_grad_norm)
+                clipped_norm = torch.nn.utils.clip_grad_norm_(student.parameters(), args.max_grad_norm)
+                grad_norm = float(clipped_norm.detach())
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 optimizer_step += 1
+
+            batch_frames = metrics["frames"]
+            epoch_frames += batch_frames
+            for name in epoch_metric_totals:
+                epoch_metric_totals[name] += metrics[name] * batch_frames
 
             record = {
                 "epoch": epoch,
                 "batch": batch_index,
                 "global_step": global_step,
                 "optimizer_step": optimizer_step,
+                "accumulation_group_size": accumulation_group_size,
+                "grad_norm": grad_norm,
                 **metrics,
             }
             with metrics_path.open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(record, sort_keys=True) + "\n")
             if batch_index % args.log_every == 0:
                 print(json.dumps(record, sort_keys=True), flush=True)
+
+        epoch_record = {
+            "record_type": "epoch_summary",
+            "epoch": epoch,
+            "global_step": global_step,
+            "optimizer_step": optimizer_step,
+            "frames": epoch_frames,
+            **{name: total / epoch_frames for name, total in epoch_metric_totals.items()},
+        }
+        with metrics_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(epoch_record, sort_keys=True) + "\n")
+        print(json.dumps(epoch_record, sort_keys=True), flush=True)
 
         metadata = {
             "format": "qwen3_tts_rvq_tail_distillation_v1",
@@ -669,11 +743,11 @@ def main() -> int:
     config_path.write_text(
         json.dumps(
             {
-                "weights": str(final_path),
                 "code_predictor_truncation_mode": "fixed",
                 "code_predictor_truncation_k": args.truncation_k,
                 "code_predictor_early_exit_fill_strategy": "distillation",
                 "code_predictor_distillation_state_size": args.state_size,
+                "code_predictor_distillation_weights": str(final_path),
                 "dataset_seed": DATASET_SEED,
                 "train_fraction": TRAIN_FRACTION,
                 "locales": list(args.locales),
