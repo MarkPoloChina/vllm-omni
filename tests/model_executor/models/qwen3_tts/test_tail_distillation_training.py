@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -13,11 +14,15 @@ import torch.nn.functional as F
 from train_qwen3_tts_tail_distillation import (
     _accumulation_group_size,
     _align_talker_hidden_to_codec_frames,
-    _build_run_id,
+    _build_run_configuration,
+    _configuration_hash,
+    _create_run_directory,
     _distillation_loss,
     _length_bucketed_batches,
     _load_training_rows,
     _load_validation_rows,
+    _reuse_prior_preprocessing_cache,
+    _write_preprocessing_cache_descriptor,
 )
 from vllm_omni.model_executor.models.common.qwen3_code_predictor_tail import (
     RVQTailDistillationConfig,
@@ -52,14 +57,60 @@ def test_partial_gradient_accumulation_group_uses_its_actual_size() -> None:
     assert sizes == [4, 4, 4, 4, 4, 4, 4, 4, 2, 2]
 
 
-def test_run_ids_are_safe_and_unique() -> None:
-    first = _build_run_id("experiment one")
-    second = _build_run_id("experiment one")
+def test_configuration_hash_is_stable_and_ignores_output_location(tmp_path) -> None:
+    arguments = SimpleNamespace(
+        output_dir=tmp_path / "output-a",
+        model_path=tmp_path / "model",
+        dataset_root=tmp_path / "dataset",
+        epochs=20,
+        batch_size=4,
+        locales=("en", "zh"),
+        resume_from=None,
+    )
+    first = _configuration_hash(_build_run_configuration(arguments))
+    arguments.output_dir = tmp_path / "output-b"
+    second = _configuration_hash(_build_run_configuration(arguments))
+    arguments.epochs = 21
+    changed = _configuration_hash(_build_run_configuration(arguments))
 
-    assert first.startswith("experiment_one_")
-    assert second.startswith("experiment_one_")
-    assert first != second
-    assert " " not in first
+    assert first == second
+    assert first != changed
+    assert len(first) == 12
+
+
+def test_run_directory_uses_timestamp_and_config_hash_without_overwrite(tmp_path) -> None:
+    started_at = datetime(2026, 8, 5, 13, 26, 50, tzinfo=timezone.utc)
+
+    first = _create_run_directory(tmp_path, "0123456789ab", started_at=started_at)
+    second = _create_run_directory(tmp_path, "0123456789ab", started_at=started_at)
+
+    assert first.name == "rvq_20260805-132650_0123456789ab"
+    assert second.name == "rvq_20260805-132651_0123456789ab"
+
+
+def test_preprocessing_cache_is_reused_inside_the_new_run_directory(tmp_path) -> None:
+    previous_cache = (
+        tmp_path
+        / "rvq_20260805-120000_0123456789ab"
+        / "preprocessing_cache"
+        / "train.safetensors"
+    )
+    previous_cache.parent.mkdir(parents=True)
+    previous_cache.write_bytes(b"cached tensors")
+    _write_preprocessing_cache_descriptor(previous_cache, "content-fingerprint")
+    current_run = tmp_path / "rvq_20260805-130000_0123456789ab"
+    current_cache = current_run / "preprocessing_cache" / "train.safetensors"
+    current_cache.parent.mkdir(parents=True)
+
+    _reuse_prior_preprocessing_cache(
+        tmp_path,
+        current_run,
+        current_cache,
+        "content-fingerprint",
+    )
+
+    assert current_cache.read_bytes() == b"cached tensors"
+    assert current_cache.with_suffix(".json").is_file()
 
 
 def test_validation_rows_are_disjoint_from_training_half(tmp_path) -> None:

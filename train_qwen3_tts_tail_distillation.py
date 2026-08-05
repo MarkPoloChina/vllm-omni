@@ -23,11 +23,13 @@ import dataclasses
 import hashlib
 import json
 import math
+import os
 import random
+import shutil
 import sys
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
@@ -79,11 +81,6 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-path", type=Path, required=True)
     parser.add_argument("--dataset-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument(
-        "--run-name",
-        default="tail_distill",
-        help="Human-readable prefix for this run's uniquely named artifacts.",
-    )
     parser.add_argument("--locales", nargs="+", choices=("en", "zh"), default=("en", "zh"))
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
@@ -139,12 +136,69 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _build_run_id(run_name: str) -> str:
-    """Build a filesystem-safe identifier that is unique for every invocation."""
-    safe_name = "".join(character if character.isalnum() or character in "-_" else "_" for character in run_name)
-    safe_name = safe_name.strip("_-") or "tail_distill"
-    timestamp = datetime.now().astimezone().strftime("%Y%m%dT%H%M%S_%f%z")
-    return f"{safe_name}_{timestamp}_{uuid.uuid4().hex[:8]}"
+def _normalize_config_value(value: Any) -> Any:
+    """Convert argparse values into a stable JSON representation."""
+    if isinstance(value, Path):
+        return str(value.expanduser().resolve())
+    if isinstance(value, (list, tuple)):
+        return [_normalize_config_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            str(key): _normalize_config_value(item)
+            for key, item in sorted(value.items())
+        }
+    return value
+
+
+def _build_run_configuration(args: argparse.Namespace) -> dict[str, Any]:
+    """Return the canonical configuration used to identify equivalent runs."""
+    arguments = {
+        name: _normalize_config_value(value)
+        for name, value in sorted(vars(args).items())
+        if name != "output_dir"
+    }
+    return {
+        "schema_version": 1,
+        "dataset_seed": DATASET_SEED,
+        "train_fraction": TRAIN_FRACTION,
+        "target_sample_rate": TARGET_SAMPLE_RATE,
+        "arguments": arguments,
+    }
+
+
+def _configuration_hash(configuration: dict[str, Any]) -> str:
+    """Return a short stable SHA-256 digest of a canonical run configuration."""
+    canonical = json.dumps(
+        configuration,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()[:12]
+
+
+def _create_run_directory(
+    output_root: Path,
+    config_hash: str,
+    *,
+    started_at: datetime | None = None,
+) -> Path:
+    """Atomically create a unique ``rvq_<time>_<config-hash>`` directory."""
+    output_root.mkdir(parents=True, exist_ok=True)
+    timestamp = started_at or datetime.now().astimezone()
+    for collision_offset in range(24 * 60 * 60):
+        candidate_timestamp = timestamp + timedelta(seconds=collision_offset)
+        candidate = output_root / (
+            f"rvq_{candidate_timestamp.strftime('%Y%m%d-%H%M%S')}_{config_hash}"
+        )
+        try:
+            candidate.mkdir()
+        except FileExistsError:
+            continue
+        return candidate
+    raise FileExistsError(
+        f"Could not allocate a unique run directory below {output_root}."
+    )
 
 
 def _parse_meta_line(root: Path, locale: str, line: str) -> SeedTTSRow | None:
@@ -248,13 +302,12 @@ def _write_manifest(
             stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
 
 
-def _preprocessing_cache_path(
-    output_dir: Path,
+def _preprocessing_cache_fingerprint(
     model_path: Path,
     rows: Sequence[SeedTTSRow],
     num_groups: int,
-) -> Path:
-    """Return a content-sensitive cache path for epoch-invariant inputs."""
+) -> str:
+    """Hash the model and source inputs used by preprocessing."""
     digest = hashlib.sha256()
     digest.update(str(model_path).encode())
     digest.update(str(num_groups).encode())
@@ -279,9 +332,88 @@ def _preprocessing_cache_path(
             stat = audio_path.stat()
             digest.update(str(audio_path).encode())
             digest.update(f"{stat.st_size}:{stat.st_mtime_ns}".encode())
+    return digest.hexdigest()
+
+
+def _preprocessing_cache_path(output_dir: Path, split_name: str) -> Path:
+    """Return a stable run-local cache filename for one dataset split."""
     cache_dir = output_dir / "preprocessing_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir / f"seed_tts_inputs_{digest.hexdigest()[:20]}.safetensors"
+    return cache_dir / f"{split_name}.safetensors"
+
+
+def _preprocessing_cache_descriptor(cache_path: Path) -> Path:
+    """Return the descriptor associated with a preprocessing cache file."""
+    return cache_path.with_suffix(".json")
+
+
+def _write_preprocessing_cache_descriptor(
+    cache_path: Path,
+    fingerprint: str,
+) -> None:
+    """Persist the content fingerprint for a completed cache atomically."""
+    descriptor_path = _preprocessing_cache_descriptor(cache_path)
+    temporary_path = descriptor_path.with_name(
+        f".{descriptor_path.name}.{uuid.uuid4().hex}.tmp"
+    )
+    temporary_path.write_text(
+        json.dumps(
+            {
+                "format": "qwen3_tts_tail_preprocessing_descriptor_v1",
+                "fingerprint": fingerprint,
+                "file": cache_path.name,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    temporary_path.replace(descriptor_path)
+
+
+def _reuse_prior_preprocessing_cache(
+    output_root: Path,
+    run_directory: Path,
+    cache_path: Path,
+    fingerprint: str,
+) -> None:
+    """Hard-link or copy a matching cache from an earlier run directory."""
+    pattern = f"rvq_*/preprocessing_cache/{cache_path.with_suffix('.json').name}"
+    for descriptor_path in sorted(output_root.glob(pattern), reverse=True):
+        if run_directory in descriptor_path.parents:
+            continue
+        try:
+            descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        source_path = descriptor_path.with_suffix(".safetensors")
+        if descriptor.get("fingerprint") != fingerprint or not source_path.is_file():
+            continue
+        try:
+            os.link(source_path, cache_path)
+            reuse_method = "hardlink"
+        except OSError:
+            temporary_path = cache_path.with_name(
+                f".{cache_path.name}.{uuid.uuid4().hex}.tmp"
+            )
+            shutil.copy2(source_path, temporary_path)
+            temporary_path.replace(cache_path)
+            reuse_method = "copy"
+        _write_preprocessing_cache_descriptor(cache_path, fingerprint)
+        print(
+            json.dumps(
+                {
+                    "record_type": "preprocessing_cache_reused",
+                    "source": str(source_path),
+                    "path": str(cache_path),
+                    "method": reuse_method,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        return
 
 
 def _load_audio_24k(path: Path) -> np.ndarray:
@@ -338,9 +470,18 @@ def _prepare_training_rows(
     batch_size: int,
     audio_loader_workers: int,
     cache_path: Path,
+    cache_fingerprint: str,
 ) -> list[PreparedSeedTTSRow]:
     """Encode and cache all epoch-invariant CPU inputs exactly once."""
-    if cache_path.is_file():
+    descriptor_path = _preprocessing_cache_descriptor(cache_path)
+    descriptor_matches = False
+    if descriptor_path.is_file():
+        try:
+            descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+            descriptor_matches = descriptor.get("fingerprint") == cache_fingerprint
+        except (OSError, json.JSONDecodeError):
+            pass
+    if cache_path.is_file() and descriptor_matches:
         cached = load_file(str(cache_path), device="cpu")
         expected_keys = {
             f"row_{row_index:05d}_{field}"
@@ -431,6 +572,7 @@ def _prepare_training_rows(
         metadata={"format": "qwen3_tts_tail_preprocessing_v1", "rows": str(len(rows))},
     )
     temporary_cache_path.replace(cache_path)
+    _write_preprocessing_cache_descriptor(cache_path, cache_fingerprint)
     print(
         json.dumps(
             {
@@ -966,11 +1108,42 @@ def main() -> int:
 
     model_path = args.model_path.expanduser().resolve()
     dataset_root = args.dataset_root.expanduser().resolve()
-    output_dir = args.output_dir.expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    run_id = _build_run_id(args.run_name)
+    output_root = args.output_dir.expanduser().resolve()
+    run_configuration = _build_run_configuration(args)
+    config_hash = _configuration_hash(run_configuration)
+    output_dir = _create_run_directory(output_root, config_hash)
+    run_id = output_dir.name
+    run_config_path = output_dir / "run_config.json"
+    run_config_path.write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "config_hash": config_hash,
+                "hash_algorithm": "sha256_first_12_hex",
+                "configuration": run_configuration,
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    print(
+        json.dumps(
+            {
+                "record_type": "run_created",
+                "run_id": run_id,
+                "config_hash": config_hash,
+                "output_dir": str(output_dir),
+                "run_config": str(run_config_path),
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
     raw_rows = _load_training_rows(dataset_root, args.locales)
-    train_manifest_path = output_dir / f"train_manifest_{run_id}.jsonl"
+    train_manifest_path = output_dir / "train_manifest.jsonl"
     _write_manifest(raw_rows, train_manifest_path, split_name="train")
 
     random.seed(DATASET_SEED)
@@ -1007,11 +1180,17 @@ def main() -> int:
         raise ValueError(f"truncation-k must be in [2, {num_groups - 1}], got {args.truncation_k}.")
 
     device = next(teacher.parameters()).device
-    preprocessing_cache_path = _preprocessing_cache_path(
-        output_dir,
+    preprocessing_cache_fingerprint = _preprocessing_cache_fingerprint(
         model_path,
         raw_rows,
         num_groups,
+    )
+    preprocessing_cache_path = _preprocessing_cache_path(output_dir, "train")
+    _reuse_prior_preprocessing_cache(
+        output_root,
+        output_dir,
+        preprocessing_cache_path,
+        preprocessing_cache_fingerprint,
     )
     rows = _prepare_training_rows(
         teacher,
@@ -1021,6 +1200,7 @@ def main() -> int:
         batch_size=args.preprocessing_batch_size,
         audio_loader_workers=args.audio_loader_workers,
         cache_path=preprocessing_cache_path,
+        cache_fingerprint=preprocessing_cache_fingerprint,
     )
     tail_lm_head_weight = torch.stack(
         [code_predictor.lm_head[index - 1].weight.detach() for index in range(args.truncation_k, num_groups)]
@@ -1058,12 +1238,14 @@ def main() -> int:
         weight_decay=args.weight_decay,
     )
     optimizer.zero_grad(set_to_none=True)
-    metrics_path = output_dir / f"metrics_{run_id}.jsonl"
+    metrics_path = output_dir / "metrics.jsonl"
     global_step = 0
     optimizer_step = 0
     training_config_record = {
         "record_type": "training_config",
         "run_id": run_id,
+        "config_hash": config_hash,
+        "run_config": str(run_config_path),
         "rows": len(rows),
         "truncation_k": args.truncation_k,
         "num_code_groups": num_groups,
@@ -1227,6 +1409,7 @@ def main() -> int:
         metadata = {
             "format": "qwen3_tts_rvq_tail_distillation_v2",
             "run_id": run_id,
+            "config_hash": config_hash,
             "seed": str(DATASET_SEED),
             "train_fraction": str(TRAIN_FRACTION),
             "truncation_k": str(args.truncation_k),
@@ -1241,17 +1424,18 @@ def main() -> int:
         _save_checkpoint(
             student,
             output_dir,
-            f"qwen3_tts_rvq_tail_{run_id}_epoch_{epoch + 1}.safetensors",
+            f"qwen3_tts_rvq_tail_epoch_{epoch + 1}.safetensors",
             metadata,
         )
 
     final_path = _save_checkpoint(
         student,
         output_dir,
-        f"qwen3_tts_rvq_tail_{run_id}.safetensors",
+        "qwen3_tts_rvq_tail.safetensors",
         {
             "format": "qwen3_tts_rvq_tail_distillation_v2",
             "run_id": run_id,
+            "config_hash": config_hash,
             "seed": str(DATASET_SEED),
             "train_fraction": str(TRAIN_FRACTION),
             "truncation_k": str(args.truncation_k),
@@ -1270,13 +1454,19 @@ def main() -> int:
         args.locales,
         args.validation_rows_per_locale,
     )
-    validation_manifest_path = output_dir / f"validation_manifest_{run_id}.jsonl"
+    validation_manifest_path = output_dir / "validation_manifest.jsonl"
     _write_manifest(validation_raw_rows, validation_manifest_path, split_name="validation")
-    validation_cache_path = _preprocessing_cache_path(
-        output_dir,
+    validation_cache_fingerprint = _preprocessing_cache_fingerprint(
         model_path,
         validation_raw_rows,
         num_groups,
+    )
+    validation_cache_path = _preprocessing_cache_path(output_dir, "validation")
+    _reuse_prior_preprocessing_cache(
+        output_root,
+        output_dir,
+        validation_cache_path,
+        validation_cache_fingerprint,
     )
     validation_rows = _prepare_training_rows(
         teacher,
@@ -1286,6 +1476,7 @@ def main() -> int:
         batch_size=args.preprocessing_batch_size,
         audio_loader_workers=args.audio_loader_workers,
         cache_path=validation_cache_path,
+        cache_fingerprint=validation_cache_fingerprint,
     )
     validation_summary = _evaluate_distillation(
         teacher=teacher,
@@ -1308,6 +1499,7 @@ def main() -> int:
     validation_summary.update(
         {
             "run_id": run_id,
+            "config_hash": config_hash,
             "checkpoint": str(final_path),
             "manifest": str(validation_manifest_path),
             "preprocessing_cache": str(validation_cache_path),
@@ -1320,7 +1512,7 @@ def main() -> int:
             },
         }
     )
-    validation_summary_path = output_dir / f"validation_summary_{run_id}.json"
+    validation_summary_path = output_dir / "validation_summary.json"
     validation_summary_path.write_text(
         json.dumps(validation_summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -1331,6 +1523,8 @@ def main() -> int:
 
     config = {
         "run_id": run_id,
+        "config_hash": config_hash,
+        "run_config": str(run_config_path),
         "code_predictor_truncation_mode": "fixed",
         "code_predictor_truncation_k": args.truncation_k,
         "code_predictor_early_exit_fill_strategy": "distillation",
@@ -1353,12 +1547,11 @@ def main() -> int:
         },
     }
     rendered_config = json.dumps(config, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    config_path = output_dir / f"distillation_config_{run_id}.json"
+    config_path = output_dir / "distillation_config.json"
     config_path.write_text(rendered_config, encoding="utf-8")
-    latest_config_path = output_dir / "distillation_config.json"
-    latest_config_path.write_text(rendered_config, encoding="utf-8")
     print(
-        f"Saved run={run_id} checkpoint={final_path} validation={validation_summary_path}",
+        f"Saved run={run_id} directory={output_dir} checkpoint={final_path} "
+        f"validation={validation_summary_path}",
         flush=True,
     )
     return 0
