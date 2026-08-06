@@ -20,6 +20,7 @@ from train_qwen3_tts_tail_distillation import (
     _distillation_loss,
     _load_training_rows,
     _project_previous_codes,
+    _select_generation_hidden,
     _validate_trace,
     _write_manifest,
 )
@@ -155,6 +156,37 @@ def test_trace_shape_validation_uses_rows_and_tail_steps() -> None:
     _validate_trace(trace, rows=2, num_groups=4, truncation_k=2)
 
 
+def test_generation_hidden_selection_matches_codec_prediction_steps() -> None:
+    """Exit and tail states come from the actual incremental CP forwards."""
+    batch_size = 2
+    hidden_size = 3
+    num_groups = 5
+    truncation_k = 3
+    hidden_steps = []
+    for generation_index in range(num_groups - 1):
+        sequence_length = 2 if generation_index == 0 else 1
+        final_hidden = torch.full(
+            (batch_size, sequence_length, hidden_size),
+            float(generation_index),
+        )
+        hidden_steps.append((torch.empty(0), final_hidden))
+    predictor_result = SimpleNamespace(
+        sequences=torch.zeros(batch_size, num_groups - 1, dtype=torch.long),
+        hidden_states=tuple(hidden_steps),
+    )
+
+    selected = _select_generation_hidden(
+        predictor_result,
+        truncation_k=truncation_k,
+        num_groups=num_groups,
+    )
+
+    # Step 1 predicts codec 2 (the exit state); steps 2 and 3 predict tail
+    # codecs 3 and 4 respectively.
+    assert selected.shape == (batch_size, 3, hidden_size)
+    assert torch.equal(selected[0, :, 0], torch.tensor([1.0, 2.0, 3.0]))
+
+
 def test_partial_accumulation_group_uses_actual_tail_size() -> None:
     """A partial final group must not be divided by the configured full size."""
     values = [
@@ -188,4 +220,3 @@ def test_configuration_hash_and_run_directory_format(tmp_path) -> None:
     assert first == same
     assert first != changed
     assert run.name == f"rvq_20260805-132650_{first}"
-

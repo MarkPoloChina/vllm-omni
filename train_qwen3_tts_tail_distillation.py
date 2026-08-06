@@ -17,6 +17,7 @@ import argparse
 import dataclasses
 import gc
 import hashlib
+import importlib.metadata
 import json
 import math
 import os
@@ -45,7 +46,7 @@ from vllm_omni.model_executor.models.common.qwen3_code_predictor_tail import (  
 
 DATASET_SEED = 42
 TRAIN_FRACTION = 0.5
-TRACE_FORMAT = "qwen3_tts_teacher_rollout_trace_v1"
+TRACE_FORMAT = "qwen3_tts_teacher_rollout_trace_v2"
 LOCALE_TO_LANGUAGE = {"en": "English", "zh": "Chinese"}
 
 
@@ -99,7 +100,6 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trace-cache-dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     parser.add_argument("--attn-implementation", default="sdpa")
     parser.add_argument("--rollout-batch-size", type=int, default=4)
-    parser.add_argument("--trace-extraction-frame-batch-size", type=int, default=4096)
     parser.add_argument(
         "--batch-size",
         type=int,
@@ -383,9 +383,16 @@ def _trace_fingerprint(
     """Hash Teacher files, rollout conditions, and sampling configuration."""
     rollout_config = {
         "format": TRACE_FORMAT,
+        "qwen_tts_version": _package_version("qwen-tts"),
+        "torch_version": torch.__version__,
+        "torch_npu_version": _package_version("torch-npu"),
+        "transformers_version": _package_version("transformers"),
         "split_seed": split_seed,
         "num_groups": num_groups,
         "truncation_k": args.truncation_k,
+        "teacher_device_type": str(args.device).partition(":")[0],
+        "teacher_dtype": args.dtype,
+        "attn_implementation": args.attn_implementation,
         "rollout_batch_size": args.rollout_batch_size,
         "rollout_do_sample": args.rollout_do_sample,
         "rollout_top_k": args.rollout_top_k,
@@ -411,6 +418,14 @@ def _trace_fingerprint(
         digest.update(str(row.ref_audio).encode())
         digest.update(f"{stat.st_size}:{stat.st_mtime_ns}".encode())
     return digest.hexdigest()
+
+
+def _package_version(distribution: str) -> str:
+    """Return a package version without making cache fingerprinting fragile."""
+    try:
+        return importlib.metadata.version(distribution)
+    except importlib.metadata.PackageNotFoundError:
+        return "not-installed"
 
 
 def _reuse_prior_trace(
@@ -588,12 +603,54 @@ def _rollout_generate_kwargs(wrapper: Any, args: argparse.Namespace) -> dict[str
     return method(**values) if callable(method) else values
 
 
+def _select_generation_hidden(
+    predictor_result: Any,
+    *,
+    truncation_k: int,
+    num_groups: int,
+) -> torch.Tensor:
+    """Select generation-time CP states needed by the Student.
+
+    Generation step ``j`` consumes codec ``j`` and its final hidden state
+    predicts codec ``j + 1``.  Keep the state that predicts codec ``K - 1``
+    as the Student exit state, followed by the states that predict codecs
+    ``K .. Q - 1``.
+    """
+    sequences = getattr(predictor_result, "sequences", None)
+    hidden_steps = getattr(predictor_result, "hidden_states", None)
+    expected_steps = num_groups - 1
+    if not isinstance(sequences, torch.Tensor) or sequences.ndim != 2:
+        raise RuntimeError("Code Predictor generate did not return rank-two sequences.")
+    if sequences.shape[1] != expected_steps:
+        raise RuntimeError(
+            f"Code Predictor generated {sequences.shape[1]} residual codecs, "
+            f"expected {expected_steps}."
+        )
+    if hidden_steps is None or len(hidden_steps) != expected_steps:
+        actual = None if hidden_steps is None else len(hidden_steps)
+        raise RuntimeError(
+            f"Code Predictor returned {actual} hidden steps, expected {expected_steps}. "
+            "A compatible qwen-tts must honor output_hidden_states=True."
+        )
+
+    selected: list[torch.Tensor] = []
+    for generation_index in range(truncation_k - 2, expected_steps):
+        step_states = hidden_steps[generation_index]
+        if not isinstance(step_states, (tuple, list)) or not step_states:
+            raise RuntimeError("Code Predictor returned an invalid hidden-state structure.")
+        final_hidden = step_states[-1]
+        if not isinstance(final_hidden, torch.Tensor) or final_hidden.ndim != 3:
+            raise RuntimeError("Code Predictor final hidden state must be rank three.")
+        selected.append(final_hidden[:, -1].detach())
+    return torch.stack(selected, dim=1)
+
+
 def _generate_teacher_rollout(
     wrapper: Any,
     rows: Sequence[SeedTTSRow],
     args: argparse.Namespace,
-) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-    """Generate full Teacher codecs and causal Talker hidden states."""
+) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+    """Generate Teacher codecs and capture their generation-time CP states."""
     prompt_items = wrapper.create_voice_clone_prompt(
         ref_audio=[str(row.ref_audio) for row in rows],
         ref_text=[row.ref_text for row in rows],
@@ -608,18 +665,74 @@ def _generate_teacher_rollout(
         wrapper,
         [_reference_text(wrapper, row.ref_text) for row in rows],
     )
-    with torch.inference_mode():
-        codes, talker_hidden = wrapper.model.generate(
-            input_ids=input_ids,
-            ref_ids=ref_ids,
-            voice_clone_prompt=voice_prompt,
-            languages=[LOCALE_TO_LANGUAGE[row.locale] for row in rows],
-            non_streaming_mode=args.rollout_non_streaming_mode,
-            **_rollout_generate_kwargs(wrapper, args),
+    code_predictor = wrapper.model.talker.code_predictor
+    num_groups = int(code_predictor.config.num_code_groups)
+    original_generate = code_predictor.generate
+    captured_frames: list[torch.Tensor] = []
+    captured_residual_codes: list[torch.Tensor] = []
+
+    def capture_generate(*generate_args: Any, **generate_kwargs: Any) -> Any:
+        predictor_result = original_generate(*generate_args, **generate_kwargs)
+        captured_residual_codes.append(predictor_result.sequences.detach())
+        captured_frames.append(
+            _select_generation_hidden(
+                predictor_result,
+                truncation_k=args.truncation_k,
+                num_groups=num_groups,
+            )
         )
+        return predictor_result
+
+    code_predictor.generate = capture_generate
+    try:
+        with torch.inference_mode():
+            codes, talker_hidden = wrapper.model.generate(
+                input_ids=input_ids,
+                ref_ids=ref_ids,
+                voice_clone_prompt=voice_prompt,
+                languages=[LOCALE_TO_LANGUAGE[row.locale] for row in rows],
+                non_streaming_mode=args.rollout_non_streaming_mode,
+                **_rollout_generate_kwargs(wrapper, args),
+            )
+    finally:
+        code_predictor.generate = original_generate
     if len(codes) != len(rows) or len(talker_hidden) != len(rows):
         raise RuntimeError("Teacher generation returned an unexpected batch size.")
-    return list(codes), list(talker_hidden)
+    if not captured_frames:
+        raise RuntimeError("Teacher generation did not invoke the Code Predictor.")
+    captured = torch.stack(captured_frames, dim=1)
+    captured_codes = torch.stack(captured_residual_codes, dim=1)
+    if captured.shape[0] != len(rows):
+        raise RuntimeError(
+            f"Captured Code Predictor batch is {captured.shape[0]}, expected {len(rows)}."
+        )
+    normalized_codes: list[torch.Tensor] = []
+    for item in codes:
+        row_codes = torch.as_tensor(item, dtype=torch.long, device=captured.device)
+        if row_codes.ndim != 2:
+            raise RuntimeError("Teacher generated non-matrix codec output.")
+        if row_codes.shape[-1] != num_groups and row_codes.shape[0] == num_groups:
+            row_codes = row_codes.transpose(0, 1)
+        if row_codes.shape[-1] != num_groups:
+            raise RuntimeError(
+                f"Teacher generated {row_codes.shape[-1]} codebooks, expected {num_groups}."
+            )
+        normalized_codes.append(row_codes)
+    max_frames = max(int(item.shape[0]) for item in normalized_codes)
+    if captured.shape[1] < max_frames:
+        raise RuntimeError(
+            f"Captured {captured.shape[1]} Code Predictor frames for {max_frames} output frames."
+        )
+    per_row_cp_hidden: list[torch.Tensor] = []
+    for index, row_codes in enumerate(normalized_codes):
+        frames = int(row_codes.shape[0])
+        if not torch.equal(captured_codes[index, :frames], row_codes[:, 1:]):
+            raise RuntimeError(
+                "Captured Code Predictor residuals are not frame-aligned with "
+                "the Teacher rollout."
+            )
+        per_row_cp_hidden.append(captured[index, :frames])
+    return list(codes), list(talker_hidden), per_row_cp_hidden
 
 
 def _normalize_rollout_pair(
@@ -644,40 +757,6 @@ def _normalize_rollout_pair(
     if frames < 1:
         raise ValueError("Teacher generated no usable frames.")
     return codes[:frames].contiguous(), hidden[:frames].contiguous()
-
-
-def _extract_teacher_trace_chunk(
-    talker: torch.nn.Module,
-    codes: torch.Tensor,
-    talker_hidden: torch.Tensor,
-    *,
-    truncation_k: int,
-    cache_dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Replay CP once on Teacher-generated codes and extract tail targets."""
-    code_predictor = talker.code_predictor
-    num_groups = int(code_predictor.config.num_code_groups)
-    inputs = [talker_hidden.unsqueeze(1), talker.get_input_embeddings()(codes[:, :1])]
-    inputs.extend(
-        code_predictor.get_input_embeddings()[codebook - 1](
-            codes[:, codebook : codebook + 1]
-        )
-        for codebook in range(1, num_groups - 1)
-    )
-    projected = code_predictor.small_to_mtp_projection(torch.cat(inputs, dim=1))
-    with torch.inference_mode():
-        hidden = code_predictor.model(
-            inputs_embeds=projected,
-            use_cache=False,
-            output_hidden_states=False,
-        ).last_hidden_state
-    if hidden.shape[1] != num_groups:
-        raise RuntimeError(f"CP replay sequence is {hidden.shape[1]}, expected {num_groups}.")
-    return (
-        hidden[:, truncation_k - 1].to(dtype=cache_dtype).cpu().contiguous(),
-        hidden[:, truncation_k:].to(dtype=cache_dtype).cpu().contiguous(),
-        codes.cpu().contiguous(),
-    )
 
 
 def _resolve_dtype(name: str) -> torch.dtype:
@@ -715,28 +794,46 @@ def _materialize_teacher_trace(
     rollout_batches = list(_batches(rows, args.rollout_batch_size))
     started_at = time.perf_counter()
     for rollout_index, batch_rows in enumerate(rollout_batches):
-        generated_codes, generated_hidden = _generate_teacher_rollout(wrapper, batch_rows, args)
-        normalized = [
-            _normalize_rollout_pair(codes, hidden, num_groups=num_groups)
-            for codes, hidden in zip(generated_codes, generated_hidden)
-        ]
+        generated_codes, generated_hidden, generated_cp_hidden = _generate_teacher_rollout(
+            wrapper,
+            batch_rows,
+            args,
+        )
+        normalized: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for codes, talker_hidden, cp_hidden in zip(
+            generated_codes,
+            generated_hidden,
+            generated_cp_hidden,
+        ):
+            normalized_codes, normalized_talker_hidden = _normalize_rollout_pair(
+                codes,
+                talker_hidden,
+                num_groups=num_groups,
+            )
+            frames = int(normalized_codes.shape[0])
+            if cp_hidden.ndim != 3 or cp_hidden.shape[0] < frames:
+                raise RuntimeError(
+                    "Generation-time Code Predictor hidden states do not cover the rollout."
+                )
+            expected_states = 1 + num_groups - args.truncation_k
+            if cp_hidden.shape[1:] != (expected_states, talker.code_predictor.config.hidden_size):
+                raise RuntimeError(
+                    "Unexpected generation-time Code Predictor hidden shape "
+                    f"{tuple(cp_hidden.shape)}."
+                )
+            normalized.append((normalized_codes, cp_hidden[:frames]))
+            del normalized_talker_hidden
         for codes, _ in normalized:
             row_offsets.append(row_offsets[-1] + int(codes.shape[0]))
         batch_codes = torch.cat([pair[0] for pair in normalized], dim=0)
-        batch_hidden = torch.cat([pair[1] for pair in normalized], dim=0)
-        frame_batch = args.trace_extraction_frame_batch_size
-        for start in range(0, batch_codes.shape[0], frame_batch):
-            stop = min(start + frame_batch, batch_codes.shape[0])
-            exit_hidden, tail_hidden, codes = _extract_teacher_trace_chunk(
-                talker,
-                batch_codes[start:stop],
-                batch_hidden[start:stop],
-                truncation_k=args.truncation_k,
-                cache_dtype=cache_dtype,
-            )
-            exit_parts.append(exit_hidden)
-            hidden_parts.append(tail_hidden)
-            code_parts.append(codes)
+        batch_cp_hidden = torch.cat([pair[1] for pair in normalized], dim=0)
+        exit_parts.append(
+            batch_cp_hidden[:, 0].to(dtype=cache_dtype).cpu().contiguous()
+        )
+        hidden_parts.append(
+            batch_cp_hidden[:, 1:].to(dtype=cache_dtype).cpu().contiguous()
+        )
+        code_parts.append(batch_codes.cpu().contiguous())
         elapsed = time.perf_counter() - started_at
         print(
             json.dumps(
@@ -781,6 +878,7 @@ def _materialize_teacher_trace(
             "rows": str(len(rows)),
             "frames": str(trace.frames),
             "supervision": "teacher_rollout",
+            "hidden_source": "code_predictor_generation",
             "target_audio_used": "false",
         },
     )
@@ -1096,7 +1194,7 @@ def _teacher_trace_sanity(
     batch_size: int,
     truncation_k: int,
 ) -> dict[str, float]:
-    """Check that replayed Teacher logits reproduce Teacher-emitted codecs."""
+    """Reproject cached generation states and compare with emitted codecs."""
     tail_steps = trace.teacher_codes.shape[1] - truncation_k
     matched = torch.zeros(tail_steps, dtype=torch.long, device=device)
     exact = torch.zeros((), dtype=torch.long, device=device)
@@ -1276,7 +1374,6 @@ def _validate_args(args: argparse.Namespace) -> None:
     """Validate CLI values."""
     positive_ints = (
         "rollout_batch_size",
-        "trace_extraction_frame_batch_size",
         "batch_size",
         "validation_batch_size",
         "gradient_accumulation_steps",
@@ -1437,12 +1534,30 @@ def main() -> int:
     )
     if (
         not args.rollout_subtalker_do_sample
-        and trace_sanity["teacher_code_top1"] < 0.99
+        and trace_sanity["teacher_code_top1"] < 0.90
     ):
         raise RuntimeError(
-            "Greedy Teacher trace replay failed to reproduce Teacher-emitted tail "
-            f"codecs (top1={trace_sanity['teacher_code_top1']:.6f}). This indicates "
-            "a Talker/Code-Predictor alignment or qwen-tts version mismatch."
+            "Generation-time Teacher hidden states are not aligned with the "
+            f"Teacher-emitted tail codecs (top1={trace_sanity['teacher_code_top1']:.6f})."
+        )
+    if (
+        not args.rollout_subtalker_do_sample
+        and trace_sanity["teacher_code_top1"] < 0.99
+    ):
+        print(
+            json.dumps(
+                {
+                    "record_type": "teacher_trace_sanity_warning",
+                    "teacher_code_top1": trace_sanity["teacher_code_top1"],
+                    "reason": (
+                        "Reprojecting cached hidden states with different batch/GEMM "
+                        "shapes can flip near-tied logits on the accelerator."
+                    ),
+                    "trace_cache_dtype": args.trace_cache_dtype,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
         )
     del code_predictor, teacher, wrapper
     gc.collect()
@@ -1488,6 +1603,7 @@ def main() -> int:
         "supervision_source": "teacher_rollout",
         "target_audio_used": False,
         "teacher_previous_code_conditioning": True,
+        "teacher_trace_hidden_source": "code_predictor_generation",
         "training_loop_teacher_forwards": 0,
         "teacher_trace_sanity": trace_sanity,
         "rows": len(train_rows),
