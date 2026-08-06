@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import time
 
@@ -37,7 +38,7 @@ from tests.e2e.accuracy.qwen3_omni.qwen3_omni_acc_bench_core import (
     run_vllm_bench_subprocess,
 )
 
-DEFAULT_SEED_TTS_DATASET = "zhaochenyang20/seed-tts-eval"
+DEFAULT_SEED_TTS_DATASET = "./seed-tts-eval"
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -58,12 +59,38 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed-tts-dataset-path", default=None)
     parser.add_argument("--seed-tts-root", type=Path, default=None)
     parser.add_argument("--seed-tts-locale", choices=("en", "zh"), default="en")
+    parser.add_argument(
+        "--seed-tts-wer-eval",
+        type=int,
+        choices=(0, 1),
+        default=1,
+        help="Set SEED_TTS_WER_EVAL for the benchmark subprocess.",
+    )
+    parser.add_argument(
+        "--seed-tts-sim-eval",
+        type=int,
+        choices=(0, 1),
+        default=1,
+        help="Set SEED_TTS_SIM_EVAL for the benchmark subprocess.",
+    )
+    parser.add_argument(
+        "--seed-tts-utmos-eval",
+        type=int,
+        choices=(0, 1),
+        default=0,
+        help="Set SEED_TTS_UTMOS_EVAL for the benchmark subprocess.",
+    )
     parser.add_argument("--seed-tts-eval-device", default=None)
     parser.add_argument(
         "--seed-tts-whisper-model",
         default=None,
         help="HF id or local directory for English WER ASR. Sets SEED_TTS_HF_WHISPER_MODEL.",
     )
+    parser.add_argument(
+            "--seed-tts-paraformer-model",
+            default=None,
+            help="HF id or local directory for Chinese WER ASR. Sets SEED_TTS_PARAFORMER_MODEL.",
+        )
     parser.add_argument(
         "--seed-tts-sim-device",
         default=None,
@@ -202,10 +229,11 @@ def main() -> int:
         dataset_path,
         "--seed-tts-locale",
         args.seed_tts_locale,
-        "--seed-tts-wer-eval",
         "--extra-body",
         args.seed_extra_body_json,
     ]
+    if args.seed_tts_wer_eval:
+        bench_argv.append("--seed-tts-wer-eval")
     if args.seed_tts_root:
         bench_argv.extend(["--seed-tts-root", str(args.seed_tts_root)])
     if args.seed_tts_wer_save_items:
@@ -216,15 +244,19 @@ def main() -> int:
     vllm = find_vllm_cli()
     print("\n$", vllm, *bench_argv, "\n", flush=True)
     extra_env = {
-        "SEED_TTS_WER_EVAL": "1",
-        "SEED_TTS_SIM_EVAL": "1",
-        "SEED_TTS_UTMOS_EVAL": "0",
-        "ASCEND_RT_VISIBLE_DEVICES": "7"
+        "SEED_TTS_WER_EVAL": str(args.seed_tts_wer_eval),
+        "SEED_TTS_SIM_EVAL": str(args.seed_tts_sim_eval),
+        "SEED_TTS_UTMOS_EVAL": str(args.seed_tts_utmos_eval),
     }
+    ascend_rt_visible_devices = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
+    if ascend_rt_visible_devices is not None:
+        extra_env["ASCEND_RT_VISIBLE_DEVICES"] = ascend_rt_visible_devices
     if args.seed_tts_eval_device:
         extra_env["SEED_TTS_EVAL_DEVICE"] = args.seed_tts_eval_device
     if args.seed_tts_whisper_model:
         extra_env["SEED_TTS_HF_WHISPER_MODEL"] = args.seed_tts_whisper_model
+    if args.seed_tts_paraformer_model:
+        extra_env["SEED_TTS_PARAFORMER_MODEL"] = args.seed_tts_paraformer_model
     if args.seed_tts_sim_device:
         extra_env["SEED_TTS_SIM_DEVICE"] = args.seed_tts_sim_device
     if args.seed_tts_wavlm_model:
