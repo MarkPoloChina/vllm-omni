@@ -340,6 +340,106 @@ def test_rmsnorm_npu_receives_gamma_with_configured_dtype(monkeypatch: pytest.Mo
     assert captured["epsilon"].item() == pytest.approx(1e-5)
 
 
+# ── RMSNorm residual tests ──
+
+
+def test_rmsnorm_matches_native_residual_contract():
+    """The vLLM IR op preserves fused residual-add and RMSNorm math."""
+    from vllm_omni.diffusion.layers.norm import RMSNorm
+
+    eps = 1e-6
+    norm = RMSNorm(4, eps=eps, dtype=torch.bfloat16)
+    norm.weight.data.copy_(torch.tensor([1.0, 0.5, 1.5, 2.0], dtype=torch.bfloat16))
+    x = torch.tensor([[1.0, -2.0, 3.0, -4.0]], dtype=torch.bfloat16)
+    residual = torch.tensor([[0.5, 1.0, -1.5, 2.0]], dtype=torch.bfloat16)
+
+    expected_fp32 = residual.float() + x.float()
+    expected_residual = expected_fp32.to(x.dtype)
+    expected_output = expected_fp32 * torch.rsqrt(expected_fp32.square().mean(-1, keepdim=True) + eps)
+    expected_output = (expected_output.to(norm.weight.dtype) * norm.weight).to(x.dtype)
+    output, updated_residual = norm.forward_native(x, residual)
+
+    torch.testing.assert_close(updated_residual, expected_residual, atol=0, rtol=0)
+    torch.testing.assert_close(output, expected_output, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "forward_name",
+    ["forward_native", "forward_cuda", "forward_hip", "forward_musa", "forward_xpu"],
+)
+def test_rmsnorm_non_npu_residual_uses_vllm_ir_op(
+    monkeypatch: pytest.MonkeyPatch,
+    forward_name: str,
+):
+    """Non-NPU platforms delegate the residual path to the vLLM IR op."""
+    from vllm import ir
+
+    from vllm_omni.diffusion.layers.norm import RMSNorm
+
+    captured: dict[str, object] = {}
+    fused_output = torch.randn(2, 4, dtype=torch.bfloat16)
+    fused_residual = torch.randn(2, 4, dtype=torch.bfloat16)
+
+    def fused_add_rms_norm(
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+    ):
+        captured.update(x=x, residual=residual, weight=weight, epsilon=epsilon)
+        return fused_output, fused_residual
+
+    monkeypatch.setattr(ir.ops, "fused_add_rms_norm", fused_add_rms_norm)
+    norm = RMSNorm(4, eps=1e-5, dtype=torch.bfloat16)
+    x = torch.randn(2, 4, dtype=torch.bfloat16)
+    residual = torch.randn(2, 4, dtype=torch.bfloat16)
+
+    output, updated_residual = getattr(norm, forward_name)(x, residual)
+
+    assert output is fused_output
+    assert updated_residual is fused_residual
+    assert captured["x"] is x
+    assert captured["residual"] is residual
+    assert captured["weight"].data_ptr() == norm.weight.data_ptr()
+    assert captured["epsilon"] == 1e-5
+
+
+def test_rmsnorm_npu_residual_uses_torch_npu_fused_op(monkeypatch: pytest.MonkeyPatch):
+    """NPU keeps the direct fused AddRMSNorm path instead of IR fallback."""
+    from vllm_omni.diffusion.layers.norm import RMSNorm
+
+    captured: dict[str, object] = {}
+    fused_output = torch.randn(2, 4, dtype=torch.bfloat16)
+    fused_residual = torch.randn(2, 4, dtype=torch.bfloat16)
+
+    def npu_add_rms_norm(
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        gamma: torch.Tensor,
+        epsilon: float,
+    ):
+        captured.update(x=x, residual=residual, gamma=gamma, epsilon=epsilon)
+        return fused_output, torch.empty(0), fused_residual
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu",
+        types.SimpleNamespace(npu_add_rms_norm=npu_add_rms_norm),
+    )
+    norm = RMSNorm(4, eps=1e-5, dtype=torch.bfloat16)
+    x = torch.randn(2, 4, dtype=torch.bfloat16)
+    residual = torch.randn(2, 4, dtype=torch.bfloat16)
+
+    output, updated_residual = norm.forward_npu(x, residual)
+
+    assert output is fused_output
+    assert updated_residual is fused_residual
+    assert captured["x"] is x
+    assert captured["residual"] is residual
+    assert captured["gamma"] is norm.weight
+    assert captured["epsilon"] == 1e-5
+
+
 # ── RMSNorm compile-path regression tests ──
 
 

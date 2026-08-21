@@ -863,6 +863,48 @@ def test_minimax_h3_advertises_the_official_ref2va_image_limit():
     assert get_diffusion_model_metadata("MiniMaxH3Pipeline").max_multimodal_image_inputs == 9
 
 
+def test_text_attention_uses_sdpa_with_local_gqa_heads(monkeypatch):
+    from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
+    from vllm_omni.diffusion.models.minimax_h3.encoder import (
+        MiniMaxH3Qwen3VLTextAttention,
+    )
+
+    class FakeEncoderGroup:
+        rank_in_group = 0
+        world_size = 2
+
+        def all_reduce(self, tensor):
+            del tensor
+
+    config = SimpleNamespace(
+        hidden_size=8,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=2,
+        rms_norm_eps=1e-6,
+    )
+    attention = MiniMaxH3Qwen3VLTextAttention(FakeEncoderGroup(), config, torch.float32)
+    assert isinstance(attention.attn, SDPAImpl)
+    attn_call = {}
+
+    def fake_attention(query, key, value, attn_metadata=None):
+        attn_call.update(query_shape=query.shape, key_shape=key.shape, value_shape=value.shape)
+        assert attn_metadata is None
+        return query
+
+    monkeypatch.setattr(attention.attn, "forward", fake_attention)
+    hidden_states = torch.randn(1, 3, config.hidden_size)
+    cos = torch.ones(1, 3, config.head_dim)
+    sin = torch.zeros_like(cos)
+
+    output = attention(hidden_states, (cos, sin))
+
+    assert attn_call["query_shape"] == (1, 3, config.num_attention_heads // 2, config.head_dim)
+    assert attn_call["key_shape"] == (1, 3, config.num_key_value_heads // 2, config.head_dim)
+    assert attn_call["value_shape"] == (1, 3, config.num_key_value_heads // 2, config.head_dim)
+    assert output.shape == hidden_states.shape
+
+
 def test_encoder_forward_uses_hook_compatible_encode_entrypoint():
     from vllm_omni.diffusion.models.minimax_h3.encoder import (
         MiniMaxH3Qwen3VLEncoder,
