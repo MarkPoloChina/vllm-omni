@@ -782,6 +782,7 @@ class MiniMaxH3Qwen3VLTextAttention(nn.Module):
             softmax_scale=self.scaling,
             num_kv_heads=self.qkv_proj.local_num_kv_heads,
             prefix=f"{prefix}.attn",
+            expand_kv_on_non_npu=True,
         )
 
     def forward(

@@ -82,10 +82,12 @@ class SDPAImpl(AttentionImpl):
         num_kv_heads: int | None = None,
         prefix: str = "",
         backend_kwargs: dict | None = None,
+        expand_kv_on_non_npu: bool = False,
         **extra_impl_args,
     ) -> None:
         self.causal = causal
         self.softmax_scale = softmax_scale
+        self.expand_kv_on_non_npu = expand_kv_on_non_npu
         if backend_kwargs:
             logger.warning("SDPAImpl ignoring backend_kwargs: %s", list(backend_kwargs.keys()))
 
@@ -96,6 +98,7 @@ class SDPAImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
         mask_mode: SDPAMaskMode = "broadcast_k",
+        force_kv_expansion: bool = False,
     ) -> torch.Tensor:
         # Normalize mask before permuting q/k/v.
         # _maybe_reshape_attn_mask expects sequence length on dim=1.
@@ -112,10 +115,11 @@ class SDPAImpl(AttentionImpl):
                     f"got q_heads={query.shape[1]} and kv_heads={key.shape[1]}."
                 )
 
-        # Keep compressed K/V only when the current platform can dispatch a
-        # native GQA kernel for this SDPA call. Other platforms retain the
-        # existing explicit-expansion behavior.
-        if enable_gqa and not can_sdpa_use_fused_gqa(query, key, value, attention_mask, self.causal):
+        # Keep compressed K/V only when the caller permits native GQA and the
+        # current platform can dispatch a fused kernel for this SDPA call.
+        if enable_gqa and (
+            force_kv_expansion or not can_sdpa_use_fused_gqa(query, key, value, attention_mask, self.causal)
+        ):
             repeat_num = query.shape[1] // key.shape[1]
             key = key.repeat_interleave(repeat_num, dim=1)
             value = value.repeat_interleave(repeat_num, dim=1)
@@ -143,7 +147,14 @@ class SDPAImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
-        return self._forward_impl(query, key, value, attn_metadata, mask_mode="broadcast_k")
+        return self._forward_impl(
+            query,
+            key,
+            value,
+            attn_metadata,
+            mask_mode="broadcast_k",
+            force_kv_expansion=self.expand_kv_on_non_npu,
+        )
 
     def forward_xpu(
         self,
@@ -152,7 +163,14 @@ class SDPAImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
-        return self._forward_impl(query, key, value, attn_metadata, mask_mode="broadcast_k")
+        return self._forward_impl(
+            query,
+            key,
+            value,
+            attn_metadata,
+            mask_mode="broadcast_k",
+            force_kv_expansion=self.expand_kv_on_non_npu,
+        )
 
     def forward_hip(
         self,
@@ -161,7 +179,14 @@ class SDPAImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
-        return self._forward_impl(query, key, value, attn_metadata, mask_mode="broadcast_k")
+        return self._forward_impl(
+            query,
+            key,
+            value,
+            attn_metadata,
+            mask_mode="broadcast_k",
+            force_kv_expansion=self.expand_kv_on_non_npu,
+        )
 
     def forward_npu(
         self,

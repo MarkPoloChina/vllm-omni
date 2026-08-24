@@ -889,6 +889,7 @@ def test_text_attention_uses_sdpa_with_local_gqa_heads(monkeypatch):
     ):
         attention = MiniMaxH3Qwen3VLTextAttention(FakeEncoderGroup(), config, torch.float32)
     assert isinstance(attention.attn, SDPAImpl)
+    assert attention.attn.expand_kv_on_non_npu is True
     attn_call = {}
 
     def fake_attention(query, key, value, attn_metadata=None):
