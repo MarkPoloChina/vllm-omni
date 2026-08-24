@@ -17,6 +17,8 @@ Environment variables:
   MINIMAX_H3_MODEL_ROOT                            Optional local MiniMax-H3 repository root.
   VLLM_TEST_MINIMAX_H3_FL2VA_MODEL                 Optional local FL2VA model path.
   VLLM_TEST_MINIMAX_H3_REF2VA_MODEL                Optional local Ref2VA model path.
+  VLLM_TEST_MINIMAX_H3_ASSET_DIR                   Optional local test-asset directory.
+  VLLM_TEST_MINIMAX_H3_OFFLINE                     Set to 1 to require all inputs locally and disable network access.
   VLLM_TEST_MINIMAX_H3_NPU_ATTENTION_BACKEND       Defaults to FLASH_ATTN.
   VLLM_TEST_MINIMAX_H3_NPU_SSIM_THRESHOLD          Defaults to the CUDA E2E threshold, 0.97.
   VLLM_TEST_MINIMAX_H3_NPU_PSNR_THRESHOLD          Defaults to the CUDA E2E threshold, 34.0.
@@ -24,6 +26,8 @@ Environment variables:
 Examples:
   ./run_minimax_h3_npu_accuracy.sh i2va
   MINIMAX_H3_MODEL_ROOT=/models/MiniMax-H3 ./run_minimax_h3_npu_accuracy.sh all
+  VLLM_TEST_MINIMAX_H3_OFFLINE=1 MINIMAX_H3_MODEL_ROOT=/models/MiniMax-H3 \
+    VLLM_TEST_MINIMAX_H3_ASSET_DIR=/data/minimax-h3-assets ./run_minimax_h3_npu_accuracy.sh i2va
 EOF
 }
 
@@ -84,11 +88,50 @@ validate_model_path() {
   fi
 }
 
+validate_asset_path() {
+  local relative_path="$1"
+  local asset_path="${VLLM_TEST_MINIMAX_H3_ASSET_DIR}/${relative_path}"
+  if [[ ! -f "${asset_path}" ]]; then
+    echo "MiniMax-H3 test asset not found: ${asset_path}" >&2
+    exit 1
+  fi
+}
+
 if [[ "${TEST_CASE}" != "ref2va" && -n "${VLLM_TEST_MINIMAX_H3_FL2VA_MODEL:-}" ]]; then
   validate_model_path "FL2VA" "${VLLM_TEST_MINIMAX_H3_FL2VA_MODEL}"
 fi
 if [[ "${TEST_CASE}" != "i2va" && -n "${VLLM_TEST_MINIMAX_H3_REF2VA_MODEL:-}" ]]; then
   validate_model_path "Ref2VA" "${VLLM_TEST_MINIMAX_H3_REF2VA_MODEL}"
+fi
+
+if [[ -n "${VLLM_TEST_MINIMAX_H3_ASSET_DIR:-}" ]]; then
+  if [[ "${TEST_CASE}" != "ref2va" ]]; then
+    validate_asset_path "i2va/reference.mp4"
+    validate_asset_path "i2va/input.png"
+  fi
+  if [[ "${TEST_CASE}" != "i2va" ]]; then
+    validate_asset_path "ref2va/reference.mp4"
+    validate_asset_path "ref2va/input_video.mp4"
+    validate_asset_path "ref2va/input_audio.mp3"
+  fi
+fi
+
+if [[ "${VLLM_TEST_MINIMAX_H3_OFFLINE:-0}" == "1" ]]; then
+  if [[ -z "${VLLM_TEST_MINIMAX_H3_ASSET_DIR:-}" ]]; then
+    echo "VLLM_TEST_MINIMAX_H3_ASSET_DIR is required in offline mode." >&2
+    exit 1
+  fi
+  if [[ "${TEST_CASE}" != "ref2va" && -z "${VLLM_TEST_MINIMAX_H3_FL2VA_MODEL:-}" ]]; then
+    echo "A local FL2VA model path is required in offline mode." >&2
+    exit 1
+  fi
+  if [[ "${TEST_CASE}" != "i2va" && -z "${VLLM_TEST_MINIMAX_H3_REF2VA_MODEL:-}" ]]; then
+    echo "A local Ref2VA model path is required in offline mode." >&2
+    exit 1
+  fi
+  export HF_HUB_OFFLINE=1
+  export TRANSFORMERS_OFFLINE=1
+  export DIFFUSERS_OFFLINE=1
 fi
 
 EXPECTED_NPU_COUNT="${EXPECTED_NPU_COUNT}" "${PYTHON_BIN}" -c '

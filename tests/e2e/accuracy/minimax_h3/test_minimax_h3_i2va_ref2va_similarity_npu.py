@@ -10,6 +10,7 @@ configuration.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -27,6 +28,7 @@ NPU_COUNT = 8
 NPU_ATTENTION_BACKEND_ENV_VAR = "VLLM_TEST_MINIMAX_H3_NPU_ATTENTION_BACKEND"
 NPU_SSIM_THRESHOLD_ENV_VAR = "VLLM_TEST_MINIMAX_H3_NPU_SSIM_THRESHOLD"
 NPU_PSNR_THRESHOLD_ENV_VAR = "VLLM_TEST_MINIMAX_H3_NPU_PSNR_THRESHOLD"
+LOCAL_ASSET_DIR_ENV_VAR = "VLLM_TEST_MINIMAX_H3_ASSET_DIR"
 
 
 def _require_npu() -> None:
@@ -44,6 +46,41 @@ def _threshold(env_var: str, default: float) -> float:
     if value < 0:
         raise ValueError(f"{env_var} must be non-negative, got {value}")
     return value
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _resolve_asset(
+    output_dir: Path,
+    *,
+    filename: str,
+    local_relative_path: str,
+    url: str,
+    sha256: str,
+    label: str,
+) -> Path:
+    asset_dir = os.environ.get(LOCAL_ASSET_DIR_ENV_VAR)
+    if not asset_dir:
+        return reference_test._download_reference_asset(
+            output_dir,
+            filename=filename,
+            url=url,
+            sha256=sha256,
+            label=label,
+        )
+
+    asset_path = Path(asset_dir).expanduser() / local_relative_path
+    if not asset_path.is_file():
+        raise FileNotFoundError(f"MiniMax H3 {label} asset not found: {asset_path}")
+    digest = _file_sha256(asset_path)
+    assert digest == sha256, f"MiniMax H3 {label} asset checksum mismatch: got {digest}, expected {sha256}"
+    return asset_path
 
 
 def _server_args() -> list[str]:
@@ -107,16 +144,18 @@ def test_minimax_h3_i2va_matches_official_reference_npu(
     reference_test.probe_binary("ffmpeg")
     reference_test.probe_binary("ffprobe")
     output_dir = reference_test.reset_artifact_dir(accuracy_artifact_root / "minimax_h3_i2va_npu")
-    reference_path = reference_test._download_reference_asset(
+    reference_path = _resolve_asset(
         output_dir,
         filename="reference.mp4",
+        local_relative_path="i2va/reference.mp4",
         url=reference_test.I2VA_REFERENCE_VIDEO_URL,
         sha256=reference_test.I2VA_REFERENCE_VIDEO_SHA256,
         label="I2VA",
     )
-    image_path = reference_test._download_reference_asset(
+    image_path = _resolve_asset(
         output_dir,
         filename="input.png",
+        local_relative_path="i2va/input.png",
         url=reference_test.I2VA_IMAGE_URL,
         sha256=reference_test.I2VA_IMAGE_SHA256,
         label="I2VA input image",
@@ -174,23 +213,26 @@ def test_minimax_h3_ref2va_matches_official_reference_npu(
     reference_test.probe_binary("ffmpeg")
     reference_test.probe_binary("ffprobe")
     output_dir = reference_test.reset_artifact_dir(accuracy_artifact_root / "minimax_h3_ref2va_npu")
-    reference_path = reference_test._download_reference_asset(
+    reference_path = _resolve_asset(
         output_dir,
         filename="reference.mp4",
+        local_relative_path="ref2va/reference.mp4",
         url=reference_test.REF2VA_REFERENCE_VIDEO_URL,
         sha256=reference_test.REF2VA_REFERENCE_VIDEO_SHA256,
         label="Ref2VA",
     )
-    input_video_path = reference_test._download_reference_asset(
+    input_video_path = _resolve_asset(
         output_dir,
         filename="input_video.mp4",
+        local_relative_path="ref2va/input_video.mp4",
         url=reference_test.REF2VA_INPUT_VIDEO_URL,
         sha256=reference_test.REF2VA_INPUT_VIDEO_SHA256,
         label="Ref2VA input video",
     )
-    input_audio_path = reference_test._download_reference_asset(
+    input_audio_path = _resolve_asset(
         output_dir,
         filename="input_audio.mp3",
+        local_relative_path="ref2va/input_audio.mp3",
         url=reference_test.REF2VA_INPUT_AUDIO_URL,
         sha256=reference_test.REF2VA_INPUT_AUDIO_SHA256,
         label="Ref2VA input audio",
